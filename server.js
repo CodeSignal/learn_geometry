@@ -4,7 +4,7 @@ const path = require('path');
 const { computeIntersections } = require('./intersections');
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = Number(process.env.PORT) || 3000;
 const configPath = path.join(__dirname, 'config.json');
 const distPath = path.join(__dirname, 'dist');
 
@@ -103,9 +103,31 @@ if (process.env.IS_PRODUCTION === 'true') {
   });
 }
 
-app.listen(port, () => {
-  console.log(`learn-geometry server listening on port ${port}`);
-});
+const maxPortAttempts = 10;
+
+function startServer(desiredPort, attemptsLeft) {
+  const server = app.listen(desiredPort, () => {
+    console.log(`learn-geometry server listening on port ${desiredPort}`);
+  });
+
+  server.on('error', (error) => {
+    if (error.code === 'EADDRINUSE' && attemptsLeft > 0) {
+      const nextPort = desiredPort + 1;
+      console.warn(`Port ${desiredPort} is already in use, trying port ${nextPort} instead...`);
+      startServer(nextPort, attemptsLeft - 1);
+      return;
+    }
+
+    if (error.code === 'EADDRINUSE') {
+      console.error(`Unable to find a free port after ${maxPortAttempts} attempts (started at ${port}). Is another instance already running?`);
+    } else {
+      console.error(`Failed to start server: ${error.message}`);
+    }
+    process.exit(1);
+  });
+}
+
+startServer(port, maxPortAttempts);
 
 function readConfig() {
   try {
