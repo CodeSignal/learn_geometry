@@ -7,7 +7,7 @@ let apiAvailable: boolean | null = null;
 
 export async function fetchConfig(): Promise<GeometryState> {
   try {
-    const response = await fetch('/api/config');
+    const response = await fetch('./api/config');
     if (response.status === 404) {
       apiAvailable = false;
       return readLocalState();
@@ -36,7 +36,7 @@ export async function postState(objects: GeomObject[]): Promise<void> {
   }
 
   try {
-    const response = await fetch('/api/state', {
+    const response = await fetch('./api/state', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

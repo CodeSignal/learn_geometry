@@ -15,7 +15,7 @@ export function TaskPanelMount() {
 
   useEffect(() => {
     let active = true;
-    fetch('/api/task')
+    fetch('./api/task')
       .then((response) => {
         if (!response.ok) throw new Error(`task fetch failed: ${response.status}`);
         return response.json();
@@ -48,7 +48,7 @@ export function TaskPanelMount() {
       config: data.task,
       initialAnswer: data.submittedAnswer,
       onChange: (answer) => {
-        fetch('/api/task/answer', {
+        fetch('./api/task/answer', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ answer }),
