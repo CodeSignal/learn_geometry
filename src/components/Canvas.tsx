@@ -1107,13 +1107,26 @@ function GeometryObject({ object, view, size, worldToScreen, isSelected, onEditL
         </g>
       );
     }
-    case 'function':
+    case 'function': {
+      const labelPosition = object.label?.trim()
+        ? functionLabelPosition(object.expression, view, size, worldToScreen)
+        : null;
       return (
-        <path
-          d={functionPath(object.expression, view, size, worldToScreen)}
-          className={`function-path${isSelected ? ' is-selected' : ''}`}
-        />
+        <g>
+          <path
+            d={functionPath(object.expression, view, size, worldToScreen)}
+            className={`function-path${isSelected ? ' is-selected' : ''}`}
+          />
+          {labelPosition && (
+            <ObjectLabel
+              screenX={labelPosition[0]}
+              screenY={labelPosition[1]}
+              label={object.label}
+            />
+          )}
+        </g>
       );
+    }
     default:
       return null;
   }
@@ -1185,6 +1198,43 @@ function functionPath(
   }
 
   return path.trim();
+}
+
+function functionLabelPosition(
+  expression: string,
+  view: View,
+  size: Size,
+  worldToScreen: (x: number, y: number) => [number, number],
+): [number, number] | null {
+  if (size.width <= 0 || size.height <= 0) return null;
+
+  const horizontalPadding = Math.min(120, size.width * 0.15);
+  const verticalPadding = Math.min(32, size.height * 0.1);
+  const left = horizontalPadding;
+  const right = size.width - horizontalPadding;
+  const preferredScreenX = Math.min(right, Math.max(left, size.width / 2 + 48));
+  const samplesPerSide = 40;
+
+  // Prefer a point just right of center so labels stay clear of the axes and
+  // HUD, then search outward in alternating directions for a visible point.
+  for (let index = 0; index <= samplesPerSide * 2; index += 1) {
+    const step = Math.ceil(index / 2);
+    const direction = index % 2 === 1 ? 1 : -1;
+    const fraction = step / samplesPerSide;
+    const screenX = direction === 1
+      ? preferredScreenX + (right - preferredScreenX) * fraction
+      : preferredScreenX - (preferredScreenX - left) * fraction;
+    const worldX = view.centerX + (screenX - size.width / 2) / view.scale;
+    const worldY = evaluateFunctionExpression(expression, worldX);
+    if (worldY === null || !Number.isFinite(worldY)) continue;
+
+    const [sx, sy] = worldToScreen(worldX, worldY);
+    if (sy >= verticalPadding && sy <= size.height - verticalPadding) {
+      return [sx, sy];
+    }
+  }
+
+  return null;
 }
 
 type GridLine = { value: number; screen: number };
