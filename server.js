@@ -231,14 +231,21 @@ function summarizeObject(object) {
     case 'line':
       return `Line${label} from (${formatNumber(object.x1)}, ${formatNumber(object.y1)}) to (${formatNumber(object.x2)}, ${formatNumber(object.y2)})`;
     case 'rectangle':
-      return `Rectangle${label} at (${formatNumber(object.x)}, ${formatNumber(object.y)}) with width ${formatNumber(object.w)} and height ${formatNumber(object.h)}`;
+      return `Rectangle${label} at (${formatNumber(object.x)}, ${formatNumber(object.y)}) with width ${formatNumber(object.w)}, height ${formatNumber(object.h)}, and ${formatRotation(object.rotation)}`;
     case 'polygon':
-      return `Polygon${label} with points ${formatPoints(object.points)}`;
+      return `Polygon${label} with points ${formatPoints(object.points)} and ${formatRotation(object.rotation)}`;
     case 'function':
       return `Function${label}: y = ${object.expression}`;
     default:
       return `Unknown object${label}`;
   }
+}
+
+function formatRotation(rotation) {
+  const radians = Number(rotation);
+  const normalizedRadians = Number.isFinite(radians) ? radians : 0;
+  const degrees = normalizedRadians * 180 / Math.PI;
+  return `rotation ${formatNumber(normalizedRadians)} radians (${formatNumber(degrees)} degrees)`;
 }
 
 function formatPoints(points) {
