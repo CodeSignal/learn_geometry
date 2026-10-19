@@ -3,13 +3,35 @@ import {
   createObjectId,
   evaluateFunctionExpression,
   formatNumber,
-  polygonCentroid,
+  parseLengthEntry,
   polygonWorldPoints,
+  rectangleCorners,
   translateObject,
   type GeomObject,
+  type MeasurementMode,
   type Tool,
 } from '../lib/geometry';
 import { computeIntersections } from '../lib/intersections';
+import {
+  angleBetweenDeg,
+  cleanCoordinate,
+  formatAngle,
+  formatLength,
+  segmentLength,
+  type Vec,
+} from '../lib/measurements';
+import { MeasurementsLayer } from './canvas/MeasurementsLayer';
+import { buildGrid, formatGridValue, formatScale } from './canvas/grid';
+import { applyHandleDrag, getHandles, pickHandle, snapRectRotation } from './canvas/handles';
+import { pickIntersection, pickObject } from './canvas/picking';
+import {
+  findTranslateIntersectionSnap,
+  snapCursor,
+  snapDelta,
+  translateAnchorPoints,
+  type SnapKind,
+} from './canvas/snapping';
+import type { Handle, HandleKind, Size, View } from './canvas/types';
 
 type CanvasProps = {
   objects: GeomObject[];
@@ -20,21 +42,7 @@ type CanvasProps = {
   onSelect: (id: string | null) => void;
   initialViewCenter: [number, number] | null;
   initialViewZoom: number | null;
-};
-
-type HandleKind =
-  | { type: 'point-move' }
-  | { type: 'line-end'; index: 0 | 1 }
-  | { type: 'rect-corner'; cornerIndex: 0 | 1 | 2 | 3 }
-  | { type: 'rect-rotate' }
-  | { type: 'circle-radius' }
-  | { type: 'polygon-vertex'; index: number }
-  | { type: 'polygon-rotate' }
-  | { type: 'translate' };
-
-type Handle = {
-  kind: HandleKind;
-  world: [number, number];
+  measurementMode: MeasurementMode;
 };
 
 type Editing = {
@@ -45,17 +53,6 @@ type Editing = {
   anchorWorld: [number, number];
   startScreenX: number;
   startScreenY: number;
-};
-
-type View = {
-  centerX: number;
-  centerY: number;
-  scale: number;
-};
-
-type Size = {
-  width: number;
-  height: number;
 };
 
 type Drawing =
@@ -70,12 +67,21 @@ const MAX_SCALE = 1e8;
 const INITIAL_SCALE = 60;
 const ZOOM_PER_PIXEL = 1.0015;
 const MIN_DRAG_PX = 2;
-const SNAP_PX = 10;
 const POLYGON_CLOSE_PX = 12;
 const DOUBLE_CLICK_MS = 350;
 const DOUBLE_CLICK_PX = 6;
 
-export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selectedId, onSelect, initialViewCenter, initialViewZoom }: CanvasProps) {
+export function Canvas({
+  objects,
+  activeTool,
+  onAddObject,
+  onUpdateObject,
+  selectedId,
+  onSelect,
+  initialViewCenter,
+  initialViewZoom,
+  measurementMode,
+}: CanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const dragStateRef = useRef<{
     pointerId: number;
@@ -112,6 +118,25 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
     draft: string;
   } | null>(null);
   const labelInputRef = useRef<HTMLInputElement>(null);
+  // What the learner is typing for the next segment's length (see
+  // parseLengthEntry); null when the entry box is closed.
+  const [lengthEntry, setLengthEntry] = useState<string | null>(null);
+  const lengthInputRef = useRef<HTMLInputElement>(null);
+  const measuring = measurementMode !== 'none';
+  const typingAllowed = measuring && acceptsTypedLength(drawing);
+  const lengthEntryOpen = lengthEntry !== null;
+
+  useEffect(() => {
+    if (!typingAllowed) setLengthEntry(null);
+  }, [typingAllowed]);
+
+  useEffect(() => {
+    if (!lengthEntryOpen) return;
+    const input = lengthInputRef.current;
+    if (!input) return;
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  }, [lengthEntryOpen]);
 
   useEffect(() => {
     if (!labelEditing) return;
@@ -230,6 +255,19 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
   // Keyboard shortcuts while drawing.
   useEffect(() => {
     function handleKey(event: KeyboardEvent) {
+      if (
+        typingAllowed &&
+        !lengthEntryOpen &&
+        /^[0-9.]$/.test(event.key) &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !isInteractiveTarget(event.target)
+      ) {
+        event.preventDefault();
+        setLengthEntry(event.key);
+        return;
+      }
       if (event.key === 'Escape' && drawing.kind !== 'idle') {
         event.preventDefault();
         setDrawing({ kind: 'idle' });
@@ -243,7 +281,26 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
     }
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [drawing, onAddObject]);
+  }, [drawing, onAddObject, typingAllowed, lengthEntryOpen]);
+
+  function commitLengthEntry() {
+    if (!typedTarget) return;
+    setLengthEntry(null);
+    if (drawing.kind === 'line') {
+      onAddObject({
+        id: createObjectId('line'),
+        type: 'line',
+        x1: drawing.start[0],
+        y1: drawing.start[1],
+        x2: typedTarget[0],
+        y2: typedTarget[1],
+      });
+      setDrawing({ kind: 'idle' });
+    } else if (drawing.kind === 'polygon') {
+      setDrawing({ kind: 'polygon', points: [...drawing.points, typedTarget], current: typedTarget });
+      lastClickRef.current = null;
+    }
+  }
 
   function eventWorldPos(event: { clientX: number; clientY: number }): [number, number] {
     const el = containerRef.current!;
@@ -281,7 +338,7 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
 
     // Handle drag for resize: only in Drag/Select mode and only when an object
     // is selected — a click on one of its handles starts the edit.
-    if (effectiveTool === 'move' && selectedObject && containerRef.current) {
+    if (effectiveTool === 'move' && selectedObject && !selectedObject.locked && containerRef.current) {
       const rect = containerRef.current.getBoundingClientRect();
       const raw = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
       const handleHit = pickHandle(getHandles(selectedObject, view.scale), raw, view.scale);
@@ -305,7 +362,7 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
       const rect = containerRef.current.getBoundingClientRect();
       const raw = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
       const objectHit = pickObject(objects, raw, view.scale, size);
-      if (objectHit && objectHit.type !== 'function') {
+      if (objectHit && objectHit.type !== 'function' && !objectHit.locked) {
         if (objectHit.id !== selectedId) onSelect(objectHit.id);
         setSelectedIntersection(null);
         containerRef.current.setPointerCapture(event.pointerId);
@@ -540,7 +597,7 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
     if (!el) return;
     const rect = el.getBoundingClientRect();
     const raw = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
-    if (selectedObject) {
+    if (selectedObject && !selectedObject.locked) {
       const handleHit = pickHandle(getHandles(selectedObject, view.scale), raw, view.scale);
       if (handleHit) {
         if (hoverClickable) setHoverClickable(false);
@@ -713,7 +770,7 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
     return out;
   }, [objects, editingId]);
   const handles = useMemo(() => {
-    if (!selectedObject) return [] as Handle[];
+    if (!selectedObject || selectedObject.locked) return [] as Handle[];
     if (editing) return getHandles(editing.preview, view.scale);
     return getHandles(selectedObject, view.scale);
   }, [selectedObject, editing, view.scale]);
@@ -724,6 +781,27 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
     const stillExists = intersections.some(([x, y]) => Math.abs(x - sx) < 1e-6 && Math.abs(y - sy) < 1e-6);
     if (!stillExists) setSelectedIntersection(null);
   }, [intersections, selectedIntersection]);
+  // Where a typed length would put the next point: along the typed direction,
+  // or toward the cursor when only a length was typed.
+  const typedTarget = useMemo((): Vec | null => {
+    if (lengthEntry === null || (drawing.kind !== 'line' && drawing.kind !== 'polygon')) return null;
+    const parsed = parseLengthEntry(lengthEntry);
+    const origin = typedLengthOrigin(drawing);
+    if (!parsed || !origin) return null;
+    const radians =
+      parsed.angleDeg !== undefined
+        ? (parsed.angleDeg * Math.PI) / 180
+        : Math.atan2(drawing.current[1] - origin[1], drawing.current[0] - origin[0]);
+    return [
+      cleanCoordinate(origin[0] + parsed.length * Math.cos(radians)),
+      cleanCoordinate(origin[1] + parsed.length * Math.sin(radians)),
+    ];
+  }, [lengthEntry, drawing]);
+  const previewDrawing: Drawing =
+    typedTarget && (drawing.kind === 'line' || drawing.kind === 'polygon') ? { ...drawing, current: typedTarget } : drawing;
+  const readout = measuring ? drawingReadout(previewDrawing, objects) : null;
+  const lengthEntryOrigin = lengthEntryOpen ? typedLengthOrigin(drawing) : null;
+
   const zoomLabel = formatScale(view.scale);
   const surfaceClass = [
     'canvas-surface',
@@ -817,7 +895,7 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
                 worldToScreen={worldToScreen}
                 isSelected={object.id === selectedId}
                 onEditLabel={(target) => {
-                  if (target.type !== 'point') return;
+                  if (target.type !== 'point' || target.locked) return;
                   setLabelEditing({
                     objectId: target.id,
                     worldX: target.x,
@@ -828,6 +906,13 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
               />
             ))}
           </g>
+          <MeasurementsLayer
+            objects={previewObjects}
+            selectedId={selectedId}
+            mode={measurementMode}
+            scale={view.scale}
+            worldToScreen={worldToScreen}
+          />
           {handles.length > 0 && (
             <g className="handles-layer">
               {handles.map((handle, index) => {
@@ -876,7 +961,15 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
               );
             })}
           </g>
-          <DrawingPreview drawing={drawing} worldToScreen={worldToScreen} view={view} />
+          <DrawingPreview drawing={previewDrawing} worldToScreen={worldToScreen} view={view} />
+          {readout && (() => {
+            const [rx, ry] = worldToScreen(readout.at[0], readout.at[1]);
+            return (
+              <text x={rx + 14} y={ry - 14} className="measure-label is-live">
+                {readout.text}
+              </text>
+            );
+          })()}
           {snapHint && (
             <SnapIndicator world={snapHint.world} kind={snapHint.kind} worldToScreen={worldToScreen} />
           )}
@@ -910,6 +1003,42 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
                 }
               }}
               placeholder="label"
+              spellCheck={false}
+              autoComplete="off"
+            />
+          </div>
+        );
+      })()}
+      {lengthEntryOrigin && (() => {
+        const [ex, ey] = worldToScreen(lengthEntryOrigin[0], lengthEntryOrigin[1]);
+        const invalid = lengthEntry !== null && lengthEntry.trim() !== '' && !typedTarget;
+        return (
+          <div
+            className="point-label-editor length-entry"
+            style={{ left: ex + 12, top: ey + 8 }}
+            onPointerDown={(event) => event.stopPropagation()}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <input
+              ref={lengthInputRef}
+              value={lengthEntry ?? ''}
+              className={invalid ? 'is-invalid' : ''}
+              aria-label="Length, then optionally a comma and an angle in degrees"
+              onChange={(event) => setLengthEntry(event.target.value)}
+              onBlur={() => setLengthEntry(null)}
+              onKeyDown={(event) => {
+                // Keep Enter / Escape from also closing or cancelling the shape.
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  commitLengthEntry();
+                } else if (event.key === 'Escape') {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setLengthEntry(null);
+                }
+              }}
+              placeholder="length, angle°"
               spellCheck={false}
               autoComplete="off"
             />
@@ -950,6 +1079,70 @@ export function Canvas({ objects, activeTool, onAddObject, onUpdateObject, selec
       </div>
     </div>
   );
+}
+
+function acceptsTypedLength(drawing: Drawing): boolean {
+  return (drawing.kind === 'line' && drawing.pinned) || (drawing.kind === 'polygon' && drawing.points.length > 0);
+}
+
+function typedLengthOrigin(drawing: Drawing): Vec | null {
+  if (drawing.kind === 'line') return drawing.start;
+  if (drawing.kind === 'polygon') return drawing.points[drawing.points.length - 1] ?? null;
+  return null;
+}
+
+const JOIN_EPS = 1e-6;
+
+// The far end of an existing segment that ends at `point`, if any.
+function segmentEndingAt(objects: GeomObject[], point: Vec): Vec | null {
+  for (const object of objects) {
+    if (object.type !== 'line') continue;
+    if (Math.abs(object.x1 - point[0]) <= JOIN_EPS && Math.abs(object.y1 - point[1]) <= JOIN_EPS) return [object.x2, object.y2];
+    if (Math.abs(object.x2 - point[0]) <= JOIN_EPS && Math.abs(object.y2 - point[1]) <= JOIN_EPS) return [object.x1, object.y1];
+  }
+  return null;
+}
+
+// Live length / angle shown next to the cursor while drawing.
+function drawingReadout(drawing: Drawing, objects: GeomObject[]): { at: Vec; text: string } | null {
+  const join = (parts: (string | null)[]) => parts.filter(Boolean).join(' · ');
+  const angleText = (vertex: Vec, a: Vec, b: Vec) => {
+    const degrees = angleBetweenDeg(vertex, a, b);
+    return Number.isFinite(degrees) ? formatAngle(degrees) : null;
+  };
+  switch (drawing.kind) {
+    case 'line': {
+      const neighbor = segmentEndingAt(objects, drawing.start);
+      return {
+        at: drawing.current,
+        text: join([
+          formatLength(segmentLength(drawing.start, drawing.current)),
+          neighbor ? angleText(drawing.start, neighbor, drawing.current) : null,
+        ]),
+      };
+    }
+    case 'polygon': {
+      const last = drawing.points[drawing.points.length - 1];
+      if (!last) return null;
+      const before = drawing.points[drawing.points.length - 2];
+      return {
+        at: drawing.current,
+        text: join([
+          formatLength(segmentLength(last, drawing.current)),
+          before ? angleText(last, before, drawing.current) : null,
+        ]),
+      };
+    }
+    case 'circle':
+      return { at: drawing.current, text: `r = ${formatLength(segmentLength(drawing.center, drawing.current))}` };
+    case 'rectangle':
+      return {
+        at: drawing.current,
+        text: `${formatLength(Math.abs(drawing.current[0] - drawing.start[0]))} × ${formatLength(Math.abs(drawing.current[1] - drawing.start[1]))}`,
+      };
+    default:
+      return null;
+  }
 }
 
 type DrawingPreviewProps = {
@@ -1054,7 +1247,7 @@ function GeometryObject({ object, view, size, worldToScreen, isSelected, onEditL
             screenX={sx}
             screenY={sy}
             label={object.label}
-            onDoubleClick={onEditLabel ? () => onEditLabel(object) : undefined}
+            onDoubleClick={onEditLabel && !object.locked ? () => onEditLabel(object) : undefined}
           />
         </g>
       );
@@ -1237,296 +1430,14 @@ function functionLabelPosition(
   return null;
 }
 
-type GridLine = { value: number; screen: number };
-
-type Grid = {
-  step: number;
-  majorVertical: GridLine[];
-  majorHorizontal: GridLine[];
-  minorVertical: GridLine[];
-  minorHorizontal: GridLine[];
-  axisX: number | null;
-  axisY: number | null;
-};
-
-function buildGrid(view: View, size: Size): Grid {
-  if (size.width === 0 || size.height === 0) {
-    return {
-      step: 1,
-      majorVertical: [],
-      majorHorizontal: [],
-      minorVertical: [],
-      minorHorizontal: [],
-      axisX: null,
-      axisY: null,
-    };
-  }
-
-  const targetPx = 90;
-  const targetUnits = targetPx / view.scale;
-  const exp = Math.floor(Math.log10(targetUnits));
-  const base = Math.pow(10, exp);
-  const remainder = targetUnits / base;
-  let major: number;
-  if (remainder < 1.5) major = base;
-  else if (remainder < 3.5) major = 2 * base;
-  else if (remainder < 7.5) major = 5 * base;
-  else major = 10 * base;
-
-  const minor = major / 5;
-
-  const wxMin = view.centerX - size.width / 2 / view.scale;
-  const wxMax = view.centerX + size.width / 2 / view.scale;
-  const wyMin = view.centerY - size.height / 2 / view.scale;
-  const wyMax = view.centerY + size.height / 2 / view.scale;
-
-  const majorVertical = collectLines(wxMin, wxMax, major, (wx) => screenX(wx, view, size));
-  const majorHorizontal = collectLines(wyMin, wyMax, major, (wy) => screenY(wy, view, size));
-  const minorVertical = collectLines(wxMin, wxMax, minor, (wx) => screenX(wx, view, size)).filter(
-    (line) => Math.abs(line.value / major - Math.round(line.value / major)) > 1e-6,
-  );
-  const minorHorizontal = collectLines(wyMin, wyMax, minor, (wy) => screenY(wy, view, size)).filter(
-    (line) => Math.abs(line.value / major - Math.round(line.value / major)) > 1e-6,
-  );
-
-  const axisXScreen = screenY(0, view, size);
-  const axisYScreen = screenX(0, view, size);
-
-  return {
-    step: major,
-    majorVertical,
-    majorHorizontal,
-    minorVertical,
-    minorHorizontal,
-    axisX: axisXScreen >= 0 && axisXScreen <= size.height ? axisXScreen : null,
-    axisY: axisYScreen >= 0 && axisYScreen <= size.width ? axisYScreen : null,
-  };
-}
-
-function collectLines(min: number, max: number, step: number, project: (value: number) => number): GridLine[] {
-  const lines: GridLine[] = [];
-  const start = Math.ceil(min / step) * step;
-  const maxLines = 400;
-  let count = 0;
-  for (let value = start; value <= max && count < maxLines; value += step, count += 1) {
-    const snapped = Math.round(value / step) * step;
-    lines.push({ value: snapped, screen: project(snapped) });
-  }
-  return lines;
-}
-
-function screenX(wx: number, view: View, size: Size): number {
-  return size.width / 2 + (wx - view.centerX) * view.scale;
-}
-
-function screenY(wy: number, view: View, size: Size): number {
-  return size.height / 2 - (wy - view.centerY) * view.scale;
-}
-
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
-}
-
-function formatGridValue(value: number, step: number): string {
-  if (step >= 1) return formatNumber(Math.round(value));
-  const decimals = Math.min(6, Math.max(0, -Math.floor(Math.log10(step))));
-  const rounded = Number(value.toFixed(decimals));
-  return formatNumber(rounded);
-}
-
-function formatScale(scale: number): string {
-  if (scale >= 1) return `${scale >= 100 ? scale.toFixed(0) : scale.toFixed(1)}×`;
-  return `1/${(1 / scale).toFixed(scale > 0.01 ? 1 : 0)}×`;
 }
 
 function worldDragPixels(a: [number, number], b: [number, number], scale: number): number {
   return Math.hypot(b[0] - a[0], b[1] - a[1]) * scale;
 }
 
-const PICK_TOLERANCE_PX = 8;
-const INTERSECTION_PICK_PX = 10;
-
-function pickIntersection(
-  intersections: [number, number][],
-  world: [number, number],
-  scale: number,
-): [number, number] | null {
-  let best: { point: [number, number]; distance: number } | null = null;
-  for (const point of intersections) {
-    const distance = Math.hypot(point[0] - world[0], point[1] - world[1]) * scale;
-    if (distance <= INTERSECTION_PICK_PX && (!best || distance < best.distance)) {
-      best = { point, distance };
-    }
-  }
-  return best?.point ?? null;
-}
-
-function pickObject(
-  objects: GeomObject[],
-  world: [number, number],
-  scale: number,
-  size: Size,
-): GeomObject | null {
-  let best: { object: GeomObject; distance: number } | null = null;
-  for (let index = objects.length - 1; index >= 0; index -= 1) {
-    const object = objects[index];
-    const distance = hitDistancePx(object, world, scale, size);
-    if (distance <= PICK_TOLERANCE_PX && (!best || distance < best.distance)) {
-      best = { object, distance };
-    }
-  }
-  return best?.object ?? null;
-}
-
-function hitDistancePx(object: GeomObject, world: [number, number], scale: number, size: Size): number {
-  const [wx, wy] = world;
-  switch (object.type) {
-    case 'point':
-      return Math.hypot(wx - object.x, wy - object.y) * scale;
-    case 'circle':
-      return Math.abs(Math.hypot(wx - object.cx, wy - object.cy) - object.r) * scale;
-    case 'line':
-      return distanceToSegment(world, [object.x1, object.y1], [object.x2, object.y2]) * scale;
-    case 'rectangle': {
-      const corners = rectangleCorners(object);
-      let min = Infinity;
-      for (let i = 0; i < 4; i += 1) {
-        const a = corners[i];
-        const b = corners[(i + 1) % 4];
-        const d = distanceToSegment(world, a, b);
-        if (d < min) min = d;
-      }
-      return min * scale;
-    }
-    case 'polygon': {
-      const pts = polygonWorldPoints(object);
-      let min = Infinity;
-      for (let i = 0; i < pts.length; i += 1) {
-        const a = pts[i];
-        const b = pts[(i + 1) % pts.length];
-        const d = distanceToSegment(world, a, b);
-        if (d < min) min = d;
-      }
-      return min * scale;
-    }
-    case 'function': {
-      const wxMin = wx - (size.width / 2) / scale;
-      const wxMax = wx + (size.width / 2) / scale;
-      const samples = 80;
-      const range = wxMax - wxMin;
-      const step = range / samples;
-      let min = Infinity;
-      let prev: [number, number] | null = null;
-      for (let i = 0; i <= samples; i += 1) {
-        const sx = wxMin + step * i;
-        const sy = evaluateFunctionExpression(object.expression, sx);
-        if (sy === null || !Number.isFinite(sy)) {
-          prev = null;
-          continue;
-        }
-        const point: [number, number] = [sx, sy];
-        if (prev) {
-          const d = distanceToSegment(world, prev, point);
-          if (d < min) min = d;
-        }
-        prev = point;
-      }
-      return min * scale;
-    }
-    default:
-      return Infinity;
-  }
-}
-
-function distanceToSegment(p: [number, number], a: [number, number], b: [number, number]): number {
-  const dx = b[0] - a[0];
-  const dy = b[1] - a[1];
-  const lenSq = dx * dx + dy * dy;
-  if (lenSq === 0) return Math.hypot(p[0] - a[0], p[1] - a[1]);
-  const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / lenSq));
-  const cx = a[0] + t * dx;
-  const cy = a[1] + t * dy;
-  return Math.hypot(p[0] - cx, p[1] - cy);
-}
-
-const HANDLE_PICK_PX = 11;
-
-function getHandles(object: GeomObject, viewScale = 1): Handle[] {
-  switch (object.type) {
-    case 'point':
-      // Points have no resize handles — translate via body drag instead.
-      return [];
-    case 'line':
-      return [
-        { kind: { type: 'line-end', index: 0 }, world: [object.x1, object.y1] },
-        { kind: { type: 'line-end', index: 1 }, world: [object.x2, object.y2] },
-      ];
-    case 'rectangle': {
-      const corners = rectangleCorners(object);
-      const handles: Handle[] = corners.map((world, index) => ({
-        kind: { type: 'rect-corner', cornerIndex: index as 0 | 1 | 2 | 3 },
-        world,
-      }));
-      const angle = object.rotation ?? 0;
-      const cos = Math.cos(angle);
-      const sin = Math.sin(angle);
-      const cx = object.x + object.w / 2;
-      const cy = object.y + object.h / 2;
-      const offset = 12 / Math.max(viewScale, 1e-6);
-      // Place the rotation handle just outside the rectangle's math bottom-right
-      // (which renders as screen bottom-right when h > 0) — adjacent to the corner
-      // resize square with a small gap.
-      const lx = object.x + object.w + offset;
-      const ly = object.y - offset;
-      const dx = lx - cx;
-      const dy = ly - cy;
-      handles.push({
-        kind: { type: 'rect-rotate' },
-        world: [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos],
-      });
-      return handles;
-    }
-    case 'circle':
-      return [{ kind: { type: 'circle-radius' }, world: [object.cx + object.r, object.cy] }];
-    case 'polygon': {
-      const worldPoints = polygonWorldPoints(object);
-      const vertexHandles: Handle[] = worldPoints.map((point, index) => ({
-        kind: { type: 'polygon-vertex', index },
-        world: point,
-      }));
-      if (worldPoints.length === 0) return vertexHandles;
-      // The centroid of the local points equals the centroid of the rotated
-      // world points (rotation around centroid leaves it fixed).
-      const centroid = polygonCentroid(worldPoints);
-      let farthestIdx = 0;
-      let farthestDist = -1;
-      for (let i = 0; i < worldPoints.length; i += 1) {
-        const [x, y] = worldPoints[i];
-        const d = Math.hypot(x - centroid[0], y - centroid[1]);
-        if (d > farthestDist) {
-          farthestDist = d;
-          farthestIdx = i;
-        }
-      }
-      const ref = worldPoints[farthestIdx];
-      const dx = ref[0] - centroid[0];
-      const dy = ref[1] - centroid[1];
-      const len = Math.hypot(dx, dy);
-      const offset = 14 / Math.max(viewScale, 1e-6);
-      const handleWorld: [number, number] =
-        len > 1e-9
-          ? [ref[0] + (dx / len) * offset, ref[1] + (dy / len) * offset]
-          : [centroid[0] + offset, centroid[1]];
-      vertexHandles.push({
-        kind: { type: 'polygon-rotate' },
-        world: handleWorld,
-      });
-      return vertexHandles;
-    }
-    default:
-      return [];
-  }
-}
 
 function makePolygon(points: [number, number][]): GeomObject {
   const label = defaultPolygonLabel(points.length);
@@ -1554,166 +1465,11 @@ function defaultPolygonLabel(vertexCount: number): string | undefined {
   }
 }
 
-function rectangleCorners(rect: Extract<GeomObject, { type: 'rectangle' }>): [number, number][] {
-  const angle = rect.rotation ?? 0;
-  const cos = Math.cos(angle);
-  const sin = Math.sin(angle);
-  const cx = rect.x + rect.w / 2;
-  const cy = rect.y + rect.h / 2;
-  const local: [number, number][] = [
-    [rect.x, rect.y],
-    [rect.x + rect.w, rect.y],
-    [rect.x + rect.w, rect.y + rect.h],
-    [rect.x, rect.y + rect.h],
-  ];
-  return local.map(([px, py]) => {
-    const dx = px - cx;
-    const dy = py - cy;
-    return [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
-  });
-}
-
-function pickHandle(handles: Handle[], world: [number, number], scale: number): Handle | null {
-  let best: { handle: Handle; distance: number } | null = null;
-  for (const handle of handles) {
-    const distance = Math.hypot(handle.world[0] - world[0], handle.world[1] - world[1]) * scale;
-    if (distance <= HANDLE_PICK_PX && (!best || distance < best.distance)) {
-      best = { handle, distance };
-    }
-  }
-  return best?.handle ?? null;
-}
-
-function applyHandleDrag(
-  original: GeomObject,
-  handle: HandleKind,
-  cursor: [number, number],
-  anchor?: [number, number],
-): GeomObject {
-  switch (handle.type) {
-    case 'point-move':
-      if (original.type !== 'point') return original;
-      return { ...original, x: cursor[0], y: cursor[1] };
-    case 'line-end': {
-      if (original.type !== 'line') return original;
-      if (handle.index === 0) return { ...original, x1: cursor[0], y1: cursor[1] };
-      return { ...original, x2: cursor[0], y2: cursor[1] };
-    }
-    case 'rect-corner': {
-      if (original.type !== 'rectangle') return original;
-      const angle = original.rotation ?? 0;
-      const cos = Math.cos(angle);
-      const sin = Math.sin(angle);
-      const oldCx = original.x + original.w / 2;
-      const oldCy = original.y + original.h / 2;
-      // World position of the opposite corner — stays fixed during the drag.
-      const localCorners: [number, number][] = [
-        [original.x, original.y],
-        [original.x + original.w, original.y],
-        [original.x + original.w, original.y + original.h],
-        [original.x, original.y + original.h],
-      ];
-      const oppLocal = localCorners[(handle.cornerIndex + 2) % 4];
-      const oppWorld: [number, number] = [
-        oldCx + (oppLocal[0] - oldCx) * cos - (oppLocal[1] - oldCy) * sin,
-        oldCy + (oppLocal[0] - oldCx) * sin + (oppLocal[1] - oldCy) * cos,
-      ];
-      // Cursor in the rect's un-rotated local frame, relative to oppWorld.
-      const vx = cursor[0] - oppWorld[0];
-      const vy = cursor[1] - oppWorld[1];
-      const localVx = vx * cos + vy * sin;
-      const localVy = -vx * sin + vy * cos;
-      const newW = Math.abs(localVx);
-      const newH = Math.abs(localVy);
-      if (!(newW > 0) || !(newH > 0)) return original;
-      // The opposite corner's local offset from the new center has signs opposite to
-      // the dragged corner's direction in local space.
-      const sx = localVx >= 0 ? 1 : -1;
-      const sy = localVy >= 0 ? 1 : -1;
-      const oppLocalOffsetX = (-sx * newW) / 2;
-      const oppLocalOffsetY = (-sy * newH) / 2;
-      const oppWorldOffsetX = oppLocalOffsetX * cos - oppLocalOffsetY * sin;
-      const oppWorldOffsetY = oppLocalOffsetX * sin + oppLocalOffsetY * cos;
-      const newCx = oppWorld[0] - oppWorldOffsetX;
-      const newCy = oppWorld[1] - oppWorldOffsetY;
-      return {
-        ...original,
-        x: newCx - newW / 2,
-        y: newCy - newH / 2,
-        w: newW,
-        h: newH,
-      };
-    }
-    case 'rect-rotate': {
-      if (original.type !== 'rectangle' || !anchor) return original;
-      const cx = original.x + original.w / 2;
-      const cy = original.y + original.h / 2;
-      const startAngle = Math.atan2(anchor[1] - cy, anchor[0] - cx);
-      const nowAngle = Math.atan2(cursor[1] - cy, cursor[0] - cx);
-      return { ...original, rotation: (original.rotation ?? 0) + (nowAngle - startAngle) };
-    }
-    case 'circle-radius': {
-      if (original.type !== 'circle') return original;
-      const r = Math.hypot(cursor[0] - original.cx, cursor[1] - original.cy);
-      if (!(r > 0)) return original;
-      return { ...original, r };
-    }
-    case 'polygon-vertex': {
-      if (original.type !== 'polygon') return original;
-      // Rebase: bake current rotation into points, drop rotation, then set the
-      // dragged vertex to the cursor's world position.
-      const worldPts = polygonWorldPoints(original);
-      const points: [number, number][] = worldPts.map((point, index) =>
-        index === handle.index ? cursor : point,
-      );
-      const next: Extract<GeomObject, { type: 'polygon' }> = { ...original, points };
-      if (next.rotation !== undefined) delete (next as { rotation?: number }).rotation;
-      return next;
-    }
-    case 'polygon-rotate': {
-      if (original.type !== 'polygon' || !anchor || original.points.length === 0) return original;
-      const center = polygonCentroid(original.points);
-      const startAngle = Math.atan2(anchor[1] - center[1], anchor[0] - center[0]);
-      const nowAngle = Math.atan2(cursor[1] - center[1], cursor[0] - center[0]);
-      let delta = nowAngle - startAngle;
-      // Snap rotation delta to 15° increments when within 3°.
-      const snapStep = Math.PI / 12;
-      const snapTol = Math.PI / 60;
-      const snapped = Math.round(delta / snapStep) * snapStep;
-      if (Math.abs(delta - snapped) <= snapTol) delta = snapped;
-      const next = (original.rotation ?? 0) + delta;
-      return { ...original, rotation: next };
-    }
-    default:
-      return original;
-  }
-}
 
 function geometryChanged(a: GeomObject, b: GeomObject): boolean {
   return JSON.stringify(a) !== JSON.stringify(b);
 }
 
-
-function snapDelta(dx: number, dy: number, step: number, scale: number): [number, number] {
-  if (!(step > 0)) return [dx, dy];
-  const sx = Math.round(dx / step) * step;
-  const sy = Math.round(dy / step) * step;
-  const offsetPx = Math.hypot(dx - sx, dy - sy) * scale;
-  if (offsetPx <= SNAP_PX) return [sx, sy];
-  return [dx, dy];
-}
-
-const ROTATION_SNAP_RAD = Math.PI / 12; // 15°
-const ROTATION_SNAP_TOL_RAD = Math.PI / 60; // within 3° of a snap target
-
-function snapRectRotation(rect: GeomObject): GeomObject {
-  if (rect.type !== 'rectangle' || rect.rotation === undefined) return rect;
-  const snapped = Math.round(rect.rotation / ROTATION_SNAP_RAD) * ROTATION_SNAP_RAD;
-  if (Math.abs(rect.rotation - snapped) <= ROTATION_SNAP_TOL_RAD) {
-    return { ...rect, rotation: snapped };
-  }
-  return rect;
-}
 
 function isInteractiveTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -1722,103 +1478,6 @@ function isInteractiveTarget(target: EventTarget | null): boolean {
   return target.isContentEditable;
 }
 
-type SnapKind = 'grid' | 'intersection';
-
-type SnapResult = {
-  world: [number, number];
-  snapped: boolean;
-  kind: SnapKind | null;
-};
-
-function translateAnchorPoints(object: GeomObject): [number, number][] {
-  switch (object.type) {
-    case 'point':
-      return [[object.x, object.y]];
-    case 'line':
-      return [
-        [object.x1, object.y1],
-        [object.x2, object.y2],
-      ];
-    case 'circle':
-      return [[object.cx, object.cy]];
-    case 'rectangle':
-      return rectangleCorners(object);
-    case 'polygon':
-      return polygonWorldPoints(object);
-    default:
-      return [];
-  }
-}
-
-function findTranslateIntersectionSnap(
-  object: GeomObject,
-  dx: number,
-  dy: number,
-  intersections: [number, number][],
-  scale: number,
-): { dx: number; dy: number; intersection: [number, number] } | null {
-  if (intersections.length === 0) return null;
-  const anchors = translateAnchorPoints(object);
-  let best: {
-    dx: number;
-    dy: number;
-    intersection: [number, number];
-    distancePx: number;
-  } | null = null;
-  for (const [ax, ay] of anchors) {
-    const projectedX = ax + dx;
-    const projectedY = ay + dy;
-    for (const isect of intersections) {
-      const distPx = Math.hypot((projectedX - isect[0]) * scale, (projectedY - isect[1]) * scale);
-      if (distPx > SNAP_PX) continue;
-      if (!best || distPx < best.distancePx) {
-        best = {
-          dx: isect[0] - ax,
-          dy: isect[1] - ay,
-          intersection: isect,
-          distancePx: distPx,
-        };
-      }
-    }
-  }
-  return best ? { dx: best.dx, dy: best.dy, intersection: best.intersection } : null;
-}
-
-function snapCursor(
-  world: [number, number],
-  scale: number,
-  step: number,
-  intersections: [number, number][],
-  vertices: [number, number][] = [],
-): SnapResult {
-  // Intersection and vertex points beat grid as long as they're not markedly
-  // farther. Among meaningful points, the strictly closer one wins.
-  let best: { world: [number, number]; distance: number; kind: SnapKind } | null = null;
-
-  if (step > 0) {
-    const gx = Math.round(world[0] / step) * step;
-    const gy = Math.round(world[1] / step) * step;
-    const gridDist = Math.hypot((world[0] - gx) * scale, (world[1] - gy) * scale);
-    if (gridDist <= SNAP_PX) {
-      best = { world: [gx, gy], distance: gridDist, kind: 'grid' };
-    }
-  }
-
-  const considerMeaningful = (px: number, py: number) => {
-    const dist = Math.hypot((world[0] - px) * scale, (world[1] - py) * scale);
-    if (dist > SNAP_PX) return;
-    const slack = best?.kind === 'grid' ? 3 : 0;
-    if (!best || dist <= best.distance + slack) {
-      best = { world: [px, py], distance: dist, kind: 'intersection' };
-    }
-  };
-
-  for (const [ix, iy] of intersections) considerMeaningful(ix, iy);
-  for (const [vx, vy] of vertices) considerMeaningful(vx, vy);
-
-  if (best) return { world: best.world, snapped: true, kind: best.kind };
-  return { world, snapped: false, kind: null };
-}
 
 type SnapIndicatorProps = {
   world: [number, number];

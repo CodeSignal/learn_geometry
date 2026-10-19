@@ -6,7 +6,19 @@ import {
   parseFormula,
   polygonWorldPoints,
   type GeomObject,
+  type MeasurementMode,
 } from '../lib/geometry';
+import {
+  directionDeg,
+  formatAngle,
+  formatLength,
+  interiorAngles,
+  lineWithDirection,
+  lineWithLength,
+  objectVertices,
+  segmentLength,
+  sideLengths,
+} from '../lib/measurements';
 
 type SidebarProps = {
   objects: GeomObject[];
@@ -16,6 +28,7 @@ type SidebarProps = {
   initialOpen: boolean | null;
   selectedId: string | null;
   onSelect: (id: string | null) => void;
+  measurementMode: MeasurementMode;
 };
 
 export function Sidebar({
@@ -26,6 +39,7 @@ export function Sidebar({
   initialOpen,
   selectedId,
   onSelect,
+  measurementMode,
 }: SidebarProps) {
   // Start collapsed by default; the config-driven preference (if any) is
   // applied once when it lands.
@@ -127,23 +141,29 @@ export function Sidebar({
                   <span className="object-icon" aria-hidden="true">{objectIcon(object)}</span>
                   <div className="object-details">
                     <strong>{objectLabel(object)}</strong>
-                    <span>{object.type}</span>
+                    <span>{object.locked ? `${object.type} · locked` : object.type}</span>
                   </div>
-                  <button
-                    type="button"
-                    className="delete-button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onDeleteObject(object.id);
-                    }}
-                    aria-label={`Delete ${objectLabel(object)}`}
-                    title="Delete"
-                  >
-                    ×
-                  </button>
+                  {!object.locked && (
+                    <button
+                      type="button"
+                      className="delete-button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onDeleteObject(object.id);
+                      }}
+                      aria-label={`Delete ${objectLabel(object)}`}
+                      title="Delete"
+                    >
+                      ×
+                    </button>
+                  )}
                 </div>
                 {object.id === selectedId && (
-                  <ObjectEditor object={object} onUpdate={onUpdateObject} />
+                  <ObjectEditor
+                    object={object}
+                    onUpdate={onUpdateObject}
+                    measurementMode={measurementMode}
+                  />
                 )}
               </Fragment>
             ))}
@@ -193,11 +213,27 @@ export function Sidebar({
 type ObjectEditorProps = {
   object: GeomObject;
   onUpdate: (object: GeomObject) => void;
+  measurementMode: MeasurementMode;
 };
 
-function ObjectEditor({ object, onUpdate }: ObjectEditorProps) {
+function ObjectEditor({ object, onUpdate: update, measurementMode }: ObjectEditorProps) {
+  // Locked objects show their values but every field is read-only.
+  const disabled = object.locked === true;
+  const onUpdate = (next: GeomObject) => {
+    if (!disabled) update(next);
+  };
+  const measuring = measurementMode !== 'none';
+  const vertices = measuring ? objectVertices(object) : null;
+  // Sides and angles of rectangles and polygons, in vertex order.
+  const shapeReadouts = vertices && vertices.length >= 3 && (
+    <>
+      <ReadoutField label="sides" value={sideLengths(vertices).map(formatLength).join(', ')} />
+      <ReadoutField label="angles" value={interiorAngles(vertices).map(formatAngle).join(', ')} />
+    </>
+  );
   const labelField = (
     <TextField
+      disabled={disabled}
       label="label"
       value={object.label ?? ''}
       onCommit={(value) => {
@@ -212,25 +248,44 @@ function ObjectEditor({ object, onUpdate }: ObjectEditorProps) {
     <div className="object-editor" onClick={(event) => event.stopPropagation()}>
       {object.type === 'point' && (
         <>
-          <NumberField label="x" value={object.x} onCommit={(x) => onUpdate({ ...object, x })} />
-          <NumberField label="y" value={object.y} onCommit={(y) => onUpdate({ ...object, y })} />
+          <NumberField disabled={disabled} label="x" value={object.x} onCommit={(x) => onUpdate({ ...object, x })} />
+          <NumberField disabled={disabled} label="y" value={object.y} onCommit={(y) => onUpdate({ ...object, y })} />
           {labelField}
         </>
       )}
       {object.type === 'line' && (
         <>
-          <NumberField label="x₁" value={object.x1} onCommit={(x1) => onUpdate({ ...object, x1 })} />
-          <NumberField label="y₁" value={object.y1} onCommit={(y1) => onUpdate({ ...object, y1 })} />
-          <NumberField label="x₂" value={object.x2} onCommit={(x2) => onUpdate({ ...object, x2 })} />
-          <NumberField label="y₂" value={object.y2} onCommit={(y2) => onUpdate({ ...object, y2 })} />
+          <NumberField disabled={disabled} label="x₁" value={object.x1} onCommit={(x1) => onUpdate({ ...object, x1 })} />
+          <NumberField disabled={disabled} label="y₁" value={object.y1} onCommit={(y1) => onUpdate({ ...object, y1 })} />
+          <NumberField disabled={disabled} label="x₂" value={object.x2} onCommit={(x2) => onUpdate({ ...object, x2 })} />
+          <NumberField disabled={disabled} label="y₂" value={object.y2} onCommit={(y2) => onUpdate({ ...object, y2 })} />
+          {measuring && (
+            <>
+              <NumberField
+                disabled={disabled}
+                label="length"
+                value={segmentLength([object.x1, object.y1], [object.x2, object.y2])}
+                onCommit={(length) => {
+                  if (length > 0) onUpdate(lineWithLength(object, length));
+                }}
+              />
+              <NumberField
+                disabled={disabled}
+                label="angle°"
+                value={directionDeg([object.x1, object.y1], [object.x2, object.y2])}
+                onCommit={(degrees) => onUpdate(lineWithDirection(object, degrees))}
+              />
+            </>
+          )}
           {labelField}
         </>
       )}
       {object.type === 'circle' && (
         <>
-          <NumberField label="cx" value={object.cx} onCommit={(cx) => onUpdate({ ...object, cx })} />
-          <NumberField label="cy" value={object.cy} onCommit={(cy) => onUpdate({ ...object, cy })} />
+          <NumberField disabled={disabled} label="cx" value={object.cx} onCommit={(cx) => onUpdate({ ...object, cx })} />
+          <NumberField disabled={disabled} label="cy" value={object.cy} onCommit={(cy) => onUpdate({ ...object, cy })} />
           <NumberField
+            disabled={disabled}
             label="r"
             value={object.r}
             onCommit={(r) => {
@@ -242,11 +297,12 @@ function ObjectEditor({ object, onUpdate }: ObjectEditorProps) {
       )}
       {object.type === 'rectangle' && (
         <>
-          <NumberField label="x" value={object.x} onCommit={(x) => onUpdate({ ...object, x })} />
-          <NumberField label="y" value={object.y} onCommit={(y) => onUpdate({ ...object, y })} />
-          <NumberField label="w" value={object.w} onCommit={(w) => onUpdate({ ...object, w })} />
-          <NumberField label="h" value={object.h} onCommit={(h) => onUpdate({ ...object, h })} />
+          <NumberField disabled={disabled} label="x" value={object.x} onCommit={(x) => onUpdate({ ...object, x })} />
+          <NumberField disabled={disabled} label="y" value={object.y} onCommit={(y) => onUpdate({ ...object, y })} />
+          <NumberField disabled={disabled} label="w" value={object.w} onCommit={(w) => onUpdate({ ...object, w })} />
+          <NumberField disabled={disabled} label="h" value={object.h} onCommit={(h) => onUpdate({ ...object, h })} />
           <NumberField
+            disabled={disabled}
             label="rot°"
             value={radToDeg(object.rotation ?? 0)}
             onCommit={(deg) => {
@@ -256,12 +312,14 @@ function ObjectEditor({ object, onUpdate }: ObjectEditorProps) {
               onUpdate(next);
             }}
           />
+          {shapeReadouts}
           {labelField}
         </>
       )}
       {object.type === 'polygon' && (
         <>
           <TextField
+            disabled={disabled}
             label="points"
             value={formatPoints(polygonWorldPoints(object))}
             onCommit={(value) => {
@@ -277,6 +335,7 @@ function ObjectEditor({ object, onUpdate }: ObjectEditorProps) {
             full
           />
           <NumberField
+            disabled={disabled}
             label="rot°"
             value={radToDeg(object.rotation ?? 0)}
             onCommit={(deg) => {
@@ -286,12 +345,14 @@ function ObjectEditor({ object, onUpdate }: ObjectEditorProps) {
               onUpdate(next);
             }}
           />
+          {shapeReadouts}
           {labelField}
         </>
       )}
       {object.type === 'function' && (
         <>
           <TextField
+            disabled={disabled}
             label="y ="
             value={object.expression}
             onCommit={(expression) => {
@@ -313,13 +374,23 @@ function ObjectEditor({ object, onUpdate }: ObjectEditorProps) {
   );
 }
 
+function ReadoutField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="editor-field full editor-readout">
+      <span>{label}</span>
+      <output>{value}</output>
+    </div>
+  );
+}
+
 type NumberFieldProps = {
   label: string;
   value: number;
   onCommit: (value: number) => void;
+  disabled?: boolean;
 };
 
-function NumberField({ label, value, onCommit }: NumberFieldProps) {
+function NumberField({ label, value, onCommit, disabled }: NumberFieldProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [draft, setDraft] = useState(() => formatDraft(value));
 
@@ -330,6 +401,9 @@ function NumberField({ label, value, onCommit }: NumberFieldProps) {
   }, [value]);
 
   function commit() {
+    // An untouched field shows a rounded value; committing it would quietly
+    // round the real one (e.g. a 5.8309… length to 5.831).
+    if (draft === formatDraft(value)) return;
     const next = Number(draft);
     if (!Number.isFinite(next)) {
       setDraft(formatDraft(value));
@@ -356,6 +430,7 @@ function NumberField({ label, value, onCommit }: NumberFieldProps) {
         ref={inputRef}
         type="text"
         inputMode="decimal"
+        disabled={disabled}
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
         onBlur={commit}
@@ -372,9 +447,10 @@ type TextFieldProps = {
   onCommit: (value: string) => void;
   mono?: boolean;
   full?: boolean;
+  disabled?: boolean;
 };
 
-function TextField({ label, value, onCommit, mono, full }: TextFieldProps) {
+function TextField({ label, value, onCommit, mono, full, disabled }: TextFieldProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [draft, setDraft] = useState(value);
 
@@ -406,6 +482,7 @@ function TextField({ label, value, onCommit, mono, full }: TextFieldProps) {
         ref={inputRef}
         type="text"
         className={mono ? 'mono' : ''}
+        disabled={disabled}
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
         onBlur={commit}

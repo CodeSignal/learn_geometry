@@ -1,12 +1,27 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { computeIntersections } = require('./intersections');
+const {
+  computeIntersections,
+  segmentLength,
+  directionDeg,
+  objectVertices,
+  sideLengths,
+  interiorAngles,
+  sharedEndpointAngles,
+  classifyPolygon,
+  parallelSidePairs,
+  perpendicularSidePairs,
+  lineRelationships,
+} = require('./intersections');
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
 const configPath = path.join(__dirname, 'config.json');
 const distPath = path.join(__dirname, 'dist');
+// Declared before readConfig() first runs (just below) — see parseTools().
+const DRAWING_TOOLS = ['point', 'line', 'circle', 'rectangle', 'polygon'];
+const MEASUREMENT_MODES = ['all', 'selected', 'none'];
 
 let state = { objects: readConfig().objects };
 let submittedAnswer = '';
@@ -19,6 +34,8 @@ app.get('/api/config', (_request, response) => {
     objects: cfg.objects,
     sidebarOpen: cfg.sidebarOpen,
     viewCenter: cfg.viewCenter,
+    tools: cfg.tools,
+    showMeasurements: cfg.showMeasurements,
   });
 });
 
@@ -27,6 +44,14 @@ app.get('/api/state', (request, response) => {
 
   if (format === 'text') {
     const lines = state.objects.map(summarizeObject);
+    const relationships = describeRelationships(state.objects);
+    if (relationships.length > 0) {
+      lines.push('');
+      lines.push(`Relationships (${relationships.length}):`);
+      for (const relationship of relationships) {
+        lines.push(`  ${relationship}`);
+      }
+    }
     const intersections = computeIntersections(state.objects);
     if (intersections.length > 0) {
       lines.push('');
@@ -157,7 +182,35 @@ function normalizeConfig(value) {
   const task = 'task' in value ? validateTask(value.task) : null;
   const sidebarOpen = typeof value.sidebarOpen === 'boolean' ? value.sidebarOpen : false;
   const viewCenter = parseViewCenter(value.viewCenter);
-  return { objects, task, sidebarOpen, viewCenter };
+  const tools = parseTools(value.tools);
+  const showMeasurements = parseMeasurementMode(value.showMeasurements);
+  return { objects, task, sidebarOpen, viewCenter, tools, showMeasurements };
+}
+
+// `tools` lists which drawing tools the toolbar shows; Drag / Select is always
+// shown. Omitted means every tool, as before.
+function parseTools(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    console.warn('Config: "tools" must be an array of tool names — showing every tool');
+    return undefined;
+  }
+  for (const tool of value) {
+    if (!DRAWING_TOOLS.includes(tool)) {
+      console.warn(`Config: unknown tool ${JSON.stringify(tool)} in "tools" — ignoring it`);
+    }
+  }
+  return DRAWING_TOOLS.filter((tool) => value.includes(tool));
+}
+
+// Omitted means "none", so a config without the key behaves as before.
+function parseMeasurementMode(value) {
+  if (value === undefined) return 'none';
+  if (!MEASUREMENT_MODES.includes(value)) {
+    console.warn(`Config: "showMeasurements" must be one of ${MEASUREMENT_MODES.join(', ')} (got ${JSON.stringify(value)}) — using "none"`);
+    return 'none';
+  }
+  return value;
 }
 
 function parseViewCenter(value) {
@@ -222,23 +275,90 @@ function summarizeObject(object) {
   }
 
   const label = object.label ? ` (${object.label})` : '';
+  const locked = object.locked ? ' [locked]' : '';
 
   switch (object.type) {
     case 'point':
-      return `Point${label} at (${formatNumber(object.x)}, ${formatNumber(object.y)})`;
+      return `Point${label} at (${formatNumber(object.x)}, ${formatNumber(object.y)})${locked}`;
     case 'circle':
-      return `Circle${label} at (${formatNumber(object.cx)}, ${formatNumber(object.cy)}) with radius ${formatNumber(object.r)}`;
-    case 'line':
-      return `Line${label} from (${formatNumber(object.x1)}, ${formatNumber(object.y1)}) to (${formatNumber(object.x2)}, ${formatNumber(object.y2)})`;
+      return `Circle${label} at (${formatNumber(object.cx)}, ${formatNumber(object.cy)}) with radius ${formatNumber(object.r)}${locked}`;
+    case 'line': {
+      const start = [object.x1, object.y1];
+      const end = [object.x2, object.y2];
+      return `Line${label} from (${formatNumber(object.x1)}, ${formatNumber(object.y1)}) to (${formatNumber(object.x2)}, ${formatNumber(object.y2)}), length ${formatNumber(segmentLength(start, end))}, direction ${formatDegrees(directionDeg(start, end))}${locked}`;
+    }
     case 'rectangle':
-      return `Rectangle${label} at (${formatNumber(object.x)}, ${formatNumber(object.y)}) with width ${formatNumber(object.w)}, height ${formatNumber(object.h)}, and ${formatRotation(object.rotation)}`;
+      return [
+        `Rectangle${label} at (${formatNumber(object.x)}, ${formatNumber(object.y)}) with width ${formatNumber(object.w)}, height ${formatNumber(object.h)}, and ${formatRotation(object.rotation)}${locked}`,
+        ...describeShape(objectVertices(object)),
+      ].join('\n');
     case 'polygon':
-      return `Polygon${label} with points ${formatPoints(object.points)} and ${formatRotation(object.rotation)}`;
+      return [
+        `Polygon${label} with points ${formatPoints(object.points)} and ${formatRotation(object.rotation)}${locked}`,
+        ...describeShape(objectVertices(object)),
+      ].join('\n');
     case 'function':
-      return `Function${label}: y = ${object.expression}`;
+      return `Function${label}: y = ${object.expression}${locked}`;
     default:
       return `Unknown object${label}`;
   }
+}
+
+// Indented detail lines for a closed shape. Vertices are named A, B, C, … in
+// drawing order (after rotation), and side AB runs from A to B.
+function describeShape(vertices) {
+  if (!Array.isArray(vertices) || vertices.length < 3) return [];
+  const n = vertices.length;
+  const sideName = (index) => `${vertexName(index)}${vertexName((index + 1) % n)}`;
+  const sides = sideLengths(vertices);
+  const angles = interiorAngles(vertices);
+  const details = [
+    `  Vertices: ${vertices.map((vertex, index) => `${vertexName(index)} ${formatPoint(vertex)}`).join(', ')}`,
+    `  Sides: ${sides.map((side, index) => `${sideName(index)} = ${formatNumber(side)}`).join(', ')}`,
+    `  Angles: ${angles.map((angle, index) => `${vertexName(index)} = ${formatDegrees(angle)}`).join(', ')}`,
+    `  Shape: ${classifyPolygon(vertices)}`,
+  ];
+  const parallel = parallelSidePairs(vertices);
+  if (parallel.length > 0) {
+    details.push(`  Parallel sides: ${parallel.map(([i, j]) => `${sideName(i)} ∥ ${sideName(j)}`).join(', ')}`);
+  }
+  const perpendicular = perpendicularSidePairs(vertices);
+  if (perpendicular.length > 0) {
+    details.push(`  Perpendicular sides: ${perpendicular.map(([i, j]) => `${sideName(i)} ⊥ ${sideName(j)}`).join(', ')}`);
+  }
+  return details;
+}
+
+// Parallel / perpendicular line segments and angles where segments meet.
+function describeRelationships(objects) {
+  const out = [];
+  for (const { a, b, kind } of lineRelationships(objects)) {
+    const verb = kind === 'perpendicular' ? 'is perpendicular to' : kind === 'parallel' ? 'is parallel to' : 'is collinear with';
+    out.push(`${lineRef(a)} ${verb} ${lineRef(b)}`);
+  }
+  for (const joint of sharedEndpointAngles(objects)) {
+    const a = objects.find((object) => object.id === joint.lineIds[0]);
+    const b = objects.find((object) => object.id === joint.lineIds[1]);
+    out.push(`Angle between ${lineRef(a)} and ${lineRef(b)} at ${formatPoint(joint.vertex)}: ${formatDegrees(joint.degrees)}`);
+  }
+  return out;
+}
+
+function lineRef(line) {
+  if (line.label) return `Line (${line.label})`;
+  return `Line from (${formatNumber(line.x1)}, ${formatNumber(line.y1)}) to (${formatNumber(line.x2)}, ${formatNumber(line.y2)})`;
+}
+
+function vertexName(index) {
+  return index < 26 ? String.fromCharCode(65 + index) : `V${index + 1}`;
+}
+
+function formatPoint(point) {
+  return `(${formatNumber(point[0])}, ${formatNumber(point[1])})`;
+}
+
+function formatDegrees(degrees) {
+  return Number.isFinite(degrees) ? `${formatNumber(degrees)}°` : 'undefined';
 }
 
 function formatRotation(rotation) {
@@ -262,5 +382,7 @@ function formatNumber(value) {
     return String(value);
   }
 
-  return Number.isInteger(number) ? String(number) : number.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  const text = Number.isInteger(number) ? String(number) : number.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  // Tiny negatives such as -1e-16 from rotation math would otherwise print as "-0".
+  return text === '-0' ? '0' : text;
 }

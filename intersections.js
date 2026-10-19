@@ -1,3 +1,8 @@
+// Server-side geometry math: intersections (mirrors src/lib/intersections.ts)
+// and measurements (mirrors src/lib/measurements.ts). The release workflow
+// packs a fixed list of files (server.js, intersections.js, dist, ...), so
+// server math lives here rather than in new modules; tests/parity.test.ts
+// checks it against the frontend copies.
 const { evaluate } = require('mathjs');
 
 const EPS = 1e-9;
@@ -281,4 +286,258 @@ function dedupe(points) {
   return out;
 }
 
-module.exports = { computeIntersections };
+// ---------------------------------------------------------------------------
+// Measurements. Everything down to sharedEndpointAngles mirrors
+// src/lib/measurements.ts; the rest (shape names, parallel / perpendicular
+// sides, line relationships) is only used for the grader-facing text output.
+
+const JOINT_EPS = 1e-6;
+// Relative tolerance for "equal", "parallel" and "perpendicular". Tight on
+// purpose: snapped or typed coordinates are exact, and a shape drawn slightly
+// off shouldn't be reported as a square.
+const REL_EPS = 1e-6;
+
+function segmentLength(a, b) {
+  return Math.hypot(b[0] - a[0], b[1] - a[1]);
+}
+
+function directionDeg(a, b) {
+  const degrees = (Math.atan2(b[1] - a[1], b[0] - a[0]) * 180) / Math.PI;
+  return degrees < 0 ? degrees + 360 : degrees;
+}
+
+function angleBetweenDeg(vertex, a, b) {
+  const ux = a[0] - vertex[0];
+  const uy = a[1] - vertex[1];
+  const vx = b[0] - vertex[0];
+  const vy = b[1] - vertex[1];
+  if ((ux === 0 && uy === 0) || (vx === 0 && vy === 0)) return NaN;
+  return (Math.abs(Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy)) * 180) / Math.PI;
+}
+
+function objectVertices(object) {
+  if (object.type === 'rectangle') return rectangleCorners(object);
+  if (object.type === 'polygon') return polygonWorldPoints(object);
+  return null;
+}
+
+function sideLengths(vertices) {
+  return vertices.map((vertex, index) => segmentLength(vertex, vertices[(index + 1) % vertices.length]));
+}
+
+function signedArea(vertices) {
+  let sum = 0;
+  for (let i = 0; i < vertices.length; i += 1) {
+    const [x1, y1] = vertices[i];
+    const [x2, y2] = vertices[(i + 1) % vertices.length];
+    sum += x1 * y2 - x2 * y1;
+  }
+  return sum / 2;
+}
+
+function interiorAngles(vertices) {
+  const n = vertices.length;
+  if (n < 3) return vertices.map(() => NaN);
+  const counterclockwise = signedArea(vertices) >= 0;
+  return vertices.map((vertex, index) => {
+    const prev = vertices[(index - 1 + n) % n];
+    const next = vertices[(index + 1) % n];
+    const toPrev = Math.atan2(prev[1] - vertex[1], prev[0] - vertex[0]);
+    const toNext = Math.atan2(next[1] - vertex[1], next[0] - vertex[0]);
+    if (segmentLength(vertex, prev) === 0 || segmentLength(vertex, next) === 0) return NaN;
+    let sweep = counterclockwise ? toPrev - toNext : toNext - toPrev;
+    sweep = ((sweep % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+    return (sweep * 180) / Math.PI;
+  });
+}
+
+function sharedEndpointAngles(objects) {
+  const lines = objects.filter(
+    (object) => object.type === 'line' && (object.x1 !== object.x2 || object.y1 !== object.y2),
+  );
+  const out = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const a = lines[i];
+      const b = lines[j];
+      const aEnds = [[a.x1, a.y1], [a.x2, a.y2]];
+      const bEnds = [[b.x1, b.y1], [b.x2, b.y2]];
+      for (let ai = 0; ai < 2; ai += 1) {
+        for (let bi = 0; bi < 2; bi += 1) {
+          const vertex = aEnds[ai];
+          const other = bEnds[bi];
+          if (Math.abs(vertex[0] - other[0]) > JOINT_EPS || Math.abs(vertex[1] - other[1]) > JOINT_EPS) continue;
+          const aFar = aEnds[1 - ai];
+          const bFar = bEnds[1 - bi];
+          if (Math.abs(aFar[0] - bFar[0]) <= JOINT_EPS && Math.abs(aFar[1] - bFar[1]) <= JOINT_EPS) continue;
+          out.push({
+            vertex,
+            lineIds: [a.id, b.id],
+            ends: [aFar, bFar],
+            degrees: angleBetweenDeg(vertex, aFar, bFar),
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function nearlyEqual(a, b) {
+  return Math.abs(a - b) <= REL_EPS * Math.max(1, Math.abs(a), Math.abs(b));
+}
+
+function sideVector(vertices, index) {
+  const a = vertices[index];
+  const b = vertices[(index + 1) % vertices.length];
+  return [b[0] - a[0], b[1] - a[1]];
+}
+
+function isParallel(u, v) {
+  const scale = Math.hypot(u[0], u[1]) * Math.hypot(v[0], v[1]);
+  return scale > 0 && Math.abs(u[0] * v[1] - u[1] * v[0]) <= REL_EPS * scale;
+}
+
+function isPerpendicular(u, v) {
+  const scale = Math.hypot(u[0], u[1]) * Math.hypot(v[0], v[1]);
+  return scale > 0 && Math.abs(u[0] * v[0] + u[1] * v[1]) <= REL_EPS * scale;
+}
+
+// Pairs of non-adjacent sides that are parallel, as [i, j] side indices.
+function parallelSidePairs(vertices) {
+  const n = vertices.length;
+  const out = [];
+  for (let i = 0; i < n; i += 1) {
+    for (let j = i + 1; j < n; j += 1) {
+      const adjacent = j === i + 1 || (i === 0 && j === n - 1);
+      if (!adjacent && isParallel(sideVector(vertices, i), sideVector(vertices, j))) out.push([i, j]);
+    }
+  }
+  return out;
+}
+
+function perpendicularSidePairs(vertices) {
+  const n = vertices.length;
+  const out = [];
+  for (let i = 0; i < n; i += 1) {
+    for (let j = i + 1; j < n; j += 1) {
+      if (isPerpendicular(sideVector(vertices, i), sideVector(vertices, j))) out.push([i, j]);
+    }
+  }
+  return out;
+}
+
+function isSelfIntersecting(vertices) {
+  const n = vertices.length;
+  for (let i = 0; i < n; i += 1) {
+    for (let j = i + 1; j < n; j += 1) {
+      const adjacent = j === i + 1 || (i === 0 && j === n - 1);
+      if (adjacent) continue;
+      const si = [vertices[i], vertices[(i + 1) % n]];
+      const sj = [vertices[j], vertices[(j + 1) % n]];
+      if (segmentSegment(si, sj)) return true;
+    }
+  }
+  return false;
+}
+
+const POLYGON_NAMES = { 3: 'triangle', 4: 'quadrilateral', 5: 'pentagon', 6: 'hexagon', 7: 'heptagon', 8: 'octagon' };
+
+function polygonBaseName(n) {
+  return POLYGON_NAMES[n] ?? `${n}-sided polygon`;
+}
+
+// A plain-language name for a closed shape, e.g. "right isosceles triangle",
+// "rhombus", "concave quadrilateral". Not shown to learners: it would give away
+// answers to "which shape is this?" questions.
+function classifyPolygon(vertices) {
+  const n = vertices.length;
+  if (n < 3) return 'degenerate polygon';
+  const sides = sideLengths(vertices);
+  if (sides.some((side) => side === 0)) return `degenerate ${polygonBaseName(n)} (repeated vertex)`;
+
+  if (n === 3) {
+    if (isParallel(sideVector(vertices, 0), sideVector(vertices, 1))) {
+      return 'degenerate triangle (collinear points)';
+    }
+    const [a, b, c] = sides;
+    const equalPairs = [nearlyEqual(a, b), nearlyEqual(b, c), nearlyEqual(c, a)].filter(Boolean).length;
+    if (equalPairs === 3) return 'equilateral triangle';
+    const sideKind = equalPairs >= 1 ? 'isosceles' : 'scalene';
+    const right = [0, 1, 2].some((i) => isPerpendicular(sideVector(vertices, i), sideVector(vertices, (i + 1) % 3)));
+    const angles = interiorAngles(vertices);
+    const angleKind = right ? 'right' : angles.some((angle) => angle > 90) ? 'obtuse' : 'acute';
+    return `${angleKind} ${sideKind} triangle`;
+  }
+
+  const name = polygonBaseName(n);
+  if (isSelfIntersecting(vertices)) return `self-intersecting ${name}`;
+  const angles = interiorAngles(vertices);
+  const concave = angles.some((angle) => angle > 180 && !nearlyEqual(angle, 180));
+  const allSidesEqual = sides.every((side) => nearlyEqual(side, sides[0]));
+
+  if (n === 4) {
+    const e = [0, 1, 2, 3].map((i) => sideVector(vertices, i));
+    const firstPair = isParallel(e[0], e[2]);
+    const secondPair = isParallel(e[1], e[3]);
+    const hasRightAngle = [0, 1, 2, 3].some((i) => isPerpendicular(e[i], e[(i + 1) % 4]));
+    if (firstPair && secondPair) {
+      if (allSidesEqual) return hasRightAngle ? 'square' : 'rhombus';
+      return hasRightAngle ? 'rectangle' : 'parallelogram';
+    }
+    if (firstPair || secondPair) {
+      const legs = firstPair ? [sides[1], sides[3]] : [sides[0], sides[2]];
+      if (nearlyEqual(legs[0], legs[1])) return 'isosceles trapezoid';
+      return hasRightAngle ? 'right trapezoid' : 'trapezoid';
+    }
+    const kite =
+      (nearlyEqual(sides[0], sides[1]) && nearlyEqual(sides[2], sides[3])) ||
+      (nearlyEqual(sides[1], sides[2]) && nearlyEqual(sides[3], sides[0]));
+    if (kite) return concave ? 'concave kite' : 'kite';
+    return concave ? 'concave quadrilateral' : 'quadrilateral';
+  }
+
+  if (concave) return `concave ${name}`;
+  const allAnglesEqual = angles.every((angle) => nearlyEqual(angle, angles[0]));
+  return allSidesEqual && allAnglesEqual ? `regular ${name}` : name;
+}
+
+// Parallel, collinear and perpendicular pairs among separate line segments.
+function lineRelationships(objects) {
+  const lines = objects.filter(
+    (object) => object.type === 'line' && (object.x1 !== object.x2 || object.y1 !== object.y2),
+  );
+  const out = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const a = lines[i];
+      const b = lines[j];
+      const u = [a.x2 - a.x1, a.y2 - a.y1];
+      const v = [b.x2 - b.x1, b.y2 - b.y1];
+      if (isParallel(u, v)) {
+        const offset = [b.x1 - a.x1, b.y1 - a.y1];
+        const collinear = Math.hypot(offset[0], offset[1]) === 0 || isParallel(u, offset);
+        out.push({ a, b, kind: collinear ? 'collinear' : 'parallel' });
+      } else if (isPerpendicular(u, v)) {
+        out.push({ a, b, kind: 'perpendicular' });
+      }
+    }
+  }
+  return out;
+}
+
+module.exports = {
+  computeIntersections,
+  segmentLength,
+  directionDeg,
+  angleBetweenDeg,
+  objectVertices,
+  sideLengths,
+  signedArea,
+  interiorAngles,
+  sharedEndpointAngles,
+  classifyPolygon,
+  parallelSidePairs,
+  perpendicularSidePairs,
+  lineRelationships,
+};

@@ -1,20 +1,31 @@
 import { evaluate, parse } from 'mathjs/number';
 
+// `locked` objects are givens: they can be selected and measured but not
+// moved, reshaped, relabeled, or deleted.
+type ObjectBase = { id: string; label?: string; locked?: boolean };
+
 export type GeomObject =
-  | { id: string; type: 'point'; x: number; y: number; label?: string }
-  | { id: string; type: 'circle'; cx: number; cy: number; r: number; label?: string }
-  | { id: string; type: 'line'; x1: number; y1: number; x2: number; y2: number; label?: string }
-  | { id: string; type: 'rectangle'; x: number; y: number; w: number; h: number; rotation?: number; label?: string }
-  | { id: string; type: 'polygon'; points: [number, number][]; rotation?: number; label?: string }
-  | { id: string; type: 'function'; expression: string; label?: string };
+  | (ObjectBase & { type: 'point'; x: number; y: number })
+  | (ObjectBase & { type: 'circle'; cx: number; cy: number; r: number })
+  | (ObjectBase & { type: 'line'; x1: number; y1: number; x2: number; y2: number })
+  | (ObjectBase & { type: 'rectangle'; x: number; y: number; w: number; h: number; rotation?: number })
+  | (ObjectBase & { type: 'polygon'; points: [number, number][]; rotation?: number })
+  | (ObjectBase & { type: 'function'; expression: string });
 
 export type Tool = 'move' | 'point' | 'line' | 'circle' | 'rectangle' | 'polygon';
+
+// Tools a config's `tools` list can enable. 'move' is always available.
+export const DRAWING_TOOLS: readonly Tool[] = ['point', 'line', 'circle', 'rectangle', 'polygon'];
+
+export type MeasurementMode = 'all' | 'selected' | 'none';
 
 export type GeometryState = {
   objects: GeomObject[];
   sidebarOpen?: boolean;
   viewCenter?: [number, number];
   viewZoom?: number;
+  tools?: Tool[];
+  showMeasurements?: MeasurementMode;
 };
 
 export type ParseResult =
@@ -50,6 +61,25 @@ export function polygonWorldPoints(
   return polygon.points.map(([x, y]) => {
     const dx = x - cx;
     const dy = y - cy;
+    return [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
+  });
+}
+
+export function rectangleCorners(rect: Extract<GeomObject, { type: 'rectangle' }>): [number, number][] {
+  const angle = rect.rotation ?? 0;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const cx = rect.x + rect.w / 2;
+  const cy = rect.y + rect.h / 2;
+  const local: [number, number][] = [
+    [rect.x, rect.y],
+    [rect.x + rect.w, rect.y],
+    [rect.x + rect.w, rect.y + rect.h],
+    [rect.x, rect.y + rect.h],
+  ];
+  return local.map(([px, py]) => {
+    const dx = px - cx;
+    const dy = py - cy;
     return [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
   });
 }
@@ -93,7 +123,9 @@ export function formatNumber(value: number): string {
     return String(value);
   }
 
-  return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  const text = Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  // Tiny negatives such as -1e-16 from rotation math would otherwise show as "-0".
+  return text === '-0' ? '0' : text;
 }
 
 export function objectIcon(object: GeomObject): string {
@@ -206,6 +238,19 @@ export function parseFormula(input: string): ParseResult {
     ok: false,
     error: 'Supported formulas: y = <expression> or (x-a)^2 + (y-b)^2 = r^2.',
   };
+}
+
+// Parses what a learner types while drawing a segment: a length, optionally
+// followed by a comma and a direction in degrees counterclockwise from +x —
+// "5", "5, 30", "3*sqrt(2), 45°".
+export function parseLengthEntry(input: string): { length: number; angleDeg?: number } | null {
+  const parts = input.replace(/°/g, '').split(',');
+  if (parts.length > 2 || !parts[0].trim()) return null;
+  const length = evaluateNumeric(parts[0]);
+  if (length === null || !(length > 0)) return null;
+  if (parts.length === 1 || !parts[1].trim()) return { length };
+  const angleDeg = evaluateNumeric(parts[1]);
+  return angleDeg === null ? null : { length, angleDeg };
 }
 
 export function evaluateFunctionExpression(expression: string, x: number): number | null {

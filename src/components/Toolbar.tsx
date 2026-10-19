@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import type { Tool } from '../lib/geometry';
+import type { MeasurementMode, Tool } from '../lib/geometry';
 
 type ToolbarProps = {
   activeTool: Tool;
@@ -10,6 +10,9 @@ type ToolbarProps = {
   onRedo: () => void;
   canUndo: boolean;
   canRedo: boolean;
+  // null shows every tool; otherwise only these (plus Drag / Select).
+  allowedTools: Tool[] | null;
+  measurementMode: MeasurementMode;
 };
 
 const IS_MAC =
@@ -35,7 +38,12 @@ export function Toolbar({
   onRedo,
   canUndo,
   canRedo,
+  allowedTools,
+  measurementMode,
 }: ToolbarProps) {
+  const visibleTools = TOOLS.filter(
+    (tool) => tool.id === 'move' || allowedTools === null || allowedTools.includes(tool.id),
+  );
   return (
     <header
       className="toolbar"
@@ -68,7 +76,7 @@ export function Toolbar({
         </button>
       </div>
       <div className="tool-buttons" role="tablist" aria-label="Geometry tools">
-        {TOOLS.map((tool) => (
+        {visibleTools.map((tool) => (
           <button
             key={tool.id}
             type="button"
@@ -84,7 +92,7 @@ export function Toolbar({
         ))}
       </div>
       <div className="toolbar-hint" aria-live="polite">
-        {hintFor(activeTool)}
+        {hintFor(activeTool, measurementMode !== 'none')}
       </div>
       <button
         type="button"
@@ -100,20 +108,22 @@ export function Toolbar({
   );
 }
 
-function hintFor(tool: Tool): string {
+const TYPED_LENGTH_HINT = ' Type a number for an exact length (5, or 5, 30 for 30°).';
+
+function hintFor(tool: Tool, measuring: boolean): string {
   switch (tool) {
     case 'move':
       return 'Click to select an object, drag to pan, scroll to zoom.';
     case 'point':
       return 'Click on the canvas to place a point.';
     case 'line':
-      return 'Drag from one endpoint to the other.';
+      return `Drag from one endpoint to the other.${measuring ? ' Or click once, then' + TYPED_LENGTH_HINT.toLowerCase() : ''}`;
     case 'circle':
       return 'Drag from the center outward.';
     case 'rectangle':
       return 'Drag from one corner to the opposite corner.';
     case 'polygon':
-      return 'Click to add vertices. Double-click or Enter to close. Esc to cancel.';
+      return `Click to add vertices. Double-click or Enter to close. Esc to cancel.${measuring ? TYPED_LENGTH_HINT : ''}`;
     default:
       return '';
   }

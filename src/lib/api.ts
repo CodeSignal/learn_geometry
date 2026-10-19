@@ -1,4 +1,4 @@
-import type { GeometryState, GeomObject } from './geometry';
+import { DRAWING_TOOLS, type GeometryState, type GeomObject, type MeasurementMode, type Tool } from './geometry';
 
 const EMPTY_STATE: GeometryState = { objects: [] };
 const LOCAL_STORAGE_KEY = 'learn-geometry:state';
@@ -95,7 +95,18 @@ function normalizeState(data: unknown): GeometryState {
     sidebarOpen: typeof candidate.sidebarOpen === 'boolean' ? candidate.sidebarOpen : undefined,
     viewCenter: view.center,
     viewZoom: view.zoom,
+    tools: parseTools((candidate as { tools?: unknown }).tools),
+    showMeasurements: parseMeasurementMode((candidate as { showMeasurements?: unknown }).showMeasurements),
   };
+}
+
+function parseTools(value: unknown): Tool[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return DRAWING_TOOLS.filter((tool) => value.includes(tool));
+}
+
+function parseMeasurementMode(value: unknown): MeasurementMode | undefined {
+  return value === 'all' || value === 'selected' || value === 'none' ? value : undefined;
 }
 
 function parseViewCenter(value: unknown): { center?: [number, number]; zoom?: number } {

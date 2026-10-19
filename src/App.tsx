@@ -4,7 +4,7 @@ import { Sidebar } from './components/Sidebar';
 import { TaskPanelMount } from './components/TaskPanelMount';
 import { Toolbar } from './components/Toolbar';
 import { fetchConfig, postState } from './lib/api';
-import { translateObject, type GeomObject, type Tool } from './lib/geometry';
+import { translateObject, type GeomObject, type MeasurementMode, type Tool } from './lib/geometry';
 
 const NUDGE_BY_ARROW: Record<string, [number, number]> = {
   ArrowUp: [0, 1],
@@ -24,6 +24,8 @@ export default function App() {
   const [initialSidebarOpen, setInitialSidebarOpen] = useState<boolean | null>(null);
   const [initialViewCenter, setInitialViewCenter] = useState<[number, number] | null>(null);
   const [initialViewZoom, setInitialViewZoom] = useState<number | null>(null);
+  const [allowedTools, setAllowedTools] = useState<Tool[] | null>(null);
+  const [measurementMode, setMeasurementMode] = useState<MeasurementMode>('none');
 
   useEffect(() => {
     let active = true;
@@ -35,6 +37,8 @@ export default function App() {
           setInitialSidebarOpen(state.sidebarOpen === true);
           setInitialViewCenter(state.viewCenter ?? null);
           setInitialViewZoom(state.viewZoom ?? null);
+          setAllowedTools(state.tools ?? null);
+          setMeasurementMode(state.showMeasurements ?? 'none');
           setStatus(null);
         }
       })
@@ -85,6 +89,7 @@ export default function App() {
   }
 
   function deleteObject(id: string) {
+    if (objectsRef.current.some((object) => object.id === id && object.locked)) return;
     if (selectedId === id) setSelectedId(null);
     commit(objectsRef.current.filter((object) => object.id !== id));
   }
@@ -93,10 +98,12 @@ export default function App() {
     commit(objectsRef.current.map((object) => (object.id === updated.id ? updated : object)));
   }
 
+  // Clearing keeps locked objects: they're the lesson's givens.
   function clearAll() {
-    if (objects.length === 0) return;
-    setSelectedId(null);
-    commit([]);
+    const kept = objects.filter((object) => object.locked);
+    if (kept.length === objects.length) return;
+    if (!kept.some((object) => object.id === selectedId)) setSelectedId(null);
+    commit(kept);
   }
 
   useEffect(() => {
@@ -124,22 +131,23 @@ export default function App() {
   useEffect(() => {
     function handleKey(event: KeyboardEvent) {
       if (isEditableTarget(event.target)) return;
-      if ((event.key === 'Delete' || event.key === 'Backspace') && selectedId) {
+      const selected = selectedId ? objects.find((object) => object.id === selectedId) : undefined;
+      if ((event.key === 'Delete' || event.key === 'Backspace') && selected) {
         event.preventDefault();
-        const id = selectedId;
+        if (selected.locked) return;
+        const id = selected.id;
         setSelectedId(null);
         commit(objects.filter((object) => object.id !== id));
         return;
       }
       const arrowDelta = NUDGE_BY_ARROW[event.key];
-      if (arrowDelta && selectedId) {
-        const selected = objects.find((object) => object.id === selectedId);
-        if (selected && selected.type !== 'function') {
+      if (arrowDelta && selected) {
+        if (selected.type !== 'function' && !selected.locked) {
           event.preventDefault();
           const multiplier = event.shiftKey ? 5 : 1;
           const [dx, dy] = arrowDelta;
           const updated = translateObject(selected, dx * multiplier, dy * multiplier);
-          commit(objects.map((object) => (object.id === selectedId ? updated : object)));
+          commit(objects.map((object) => (object.id === selected.id ? updated : object)));
           return;
         }
       }
@@ -168,13 +176,16 @@ export default function App() {
         initialOpen={initialSidebarOpen}
         selectedId={selectedId}
         onSelect={setSelectedId}
+        measurementMode={measurementMode}
       />
       <div className="main-area">
         <Toolbar
           activeTool={activeTool}
           onSelectTool={setActiveTool}
           onClearAll={clearAll}
-          hasObjects={objects.length > 0}
+          hasObjects={objects.some((object) => !object.locked)}
+          allowedTools={allowedTools}
+          measurementMode={measurementMode}
           onUndo={undo}
           onRedo={redo}
           canUndo={past.length > 0}
@@ -189,6 +200,7 @@ export default function App() {
           onSelect={setSelectedId}
           initialViewCenter={initialViewCenter}
           initialViewZoom={initialViewZoom}
+          measurementMode={measurementMode}
         />
       </div>
       {(loading || status) && (
