@@ -32,7 +32,8 @@ npm run preview    # builds dist/, serves everything from Express on :3000
 Checks (neither is part of the release build):
 
 ```sh
-npm test           # Vitest: geometry math, frontend/server parity, server text output
+npm test           # Vitest: geometry math, frontend/server parity, server output,
+                   #   and backward compatibility (see below)
 npm run typecheck  # tsc --noEmit (vite build doesn't type-check)
 ```
 
@@ -224,8 +225,8 @@ and proxied through Vite in development.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/config` | Returns `{ objects, sidebarOpen, viewCenter, tools, showMeasurements }` from `config.json`. Always re-reads from disk. |
-| `GET` | `/api/state` | Returns the current in-memory objects array. `?format=text` returns a human-readable summary for graders (see below). |
+| `GET` | `/api/config` | Returns `{ objects, sidebarOpen, viewCenter }` from `config.json`, plus `tools` and `showMeasurements` when the config sets them. Always re-reads from disk. |
+| `GET` | `/api/state` | Returns the current in-memory objects array. `?format=text` returns a human-readable summary plus a list of all intersection points; with `"detailedTextState": true` in the config it also includes measurements (see below). |
 | `POST` | `/api/state` | Body `{ objects: GeomObject[] }`. Replaces the in-memory state. Called automatically by the frontend after every change. |
 | `GET` | `/api/task` | Returns `{ task, submittedAnswer }`. `?format=text` returns a human-readable block including the learner's current answer (or `"(no task configured)"`). |
 | `POST` | `/api/task/answer` | Body `{ answer: string }`. For multiple_choice, validates that `answer` is `""` or one of `options` (else `400`). |
@@ -235,10 +236,27 @@ only — it's the seed, never the destination.
 
 ### Text state (`GET /api/state?format=text`)
 
-One line per object, then a `Relationships` section and an
-`Intersections` section when there are any. Measurements are always
-included here, whatever `showMeasurements` says, since this output is
-for graders rather than learners. Locked objects end with `[locked]`.
+By default this is one line per object followed by an `Intersections`
+section, exactly as before:
+
+```
+Line (AB) from (0, 0) to (4, 0) [locked]
+Line from (0, 0) to (0, 3)
+Polygon with points (6, 0), (10, 0), (6, 3) and rotation 0 radians (0 degrees)
+
+Intersections (1):
+  (0, 0)
+```
+
+The only addition in default mode is the `[locked]` suffix, which can
+only appear when the config has locked objects.
+
+#### Detailed text state (`"detailedTextState": true`)
+
+Setting `"detailedTextState": true` in `config.json` adds measurements
+for graders. It only **adds** text — every line of the default output
+is still there, unchanged — and it's independent of `showMeasurements`,
+so a lesson can hide measurements from learners and still grade on them.
 
 ```
 Line (AB) from (0, 0) to (4, 0), length 4, direction 0° [locked]
@@ -258,8 +276,10 @@ Intersections (1):
   (0, 0)
 ```
 
-- Rectangles and polygons list their vertices after rotation, named A,
-  B, C… in drawing order; side AB runs from A to B.
+- Segments gain `, length …, direction …°` at the end of their line.
+- Rectangles and polygons gain indented lines listing their vertices
+  after rotation, named A, B, C… in drawing order; side AB runs from A
+  to B.
 - `Shape` names triangles by angles and sides (`acute isosceles
   triangle`), quadrilaterals by type (`square`, `rectangle`, `rhombus`,
   `parallelogram`, `trapezoid`, `isosceles trapezoid`, `right
@@ -268,9 +288,12 @@ Intersections (1):
   checks use a tight tolerance, so a shape drawn slightly off isn't
   called a square. Shape names are deliberately **not** shown in the
   learner's UI, where they'd give away "which shape is this?" answers.
-- `Relationships` lists line segments that are parallel, collinear, or
-  perpendicular to each other, and the angle wherever two segments
-  share an endpoint.
+- `Relationships` (new section, before `Intersections`) lists line
+  segments that are parallel, collinear, or perpendicular to each other,
+  and the angle wherever two segments share an endpoint.
+- Newly computed numbers (lengths, angles, rotated vertices) print tiny
+  negatives as `0`. Coordinates in the default lines keep the original
+  formatting, which can print `-0` for values like `-0.0001`.
 
 ---
 
@@ -287,7 +310,8 @@ The single source of truth for what loads when the app starts.
   "sidebarOpen": false,    /* optional, defaults to false */
   "viewCenter":  [0, 0],   /* optional, [x, y] or [x, y, zoom] — defaults to origin at 60× */
   "tools":       ["line", "polygon"],  /* optional, defaults to every tool */
-  "showMeasurements": "none"           /* optional: "all" | "selected" | "none" (default) */
+  "showMeasurements": "none",          /* optional: "all" | "selected" | "none" (default) */
+  "detailedTextState": false           /* optional, adds measurements to the text state */
 }
 ```
 
@@ -313,10 +337,20 @@ The single source of truth for what loads when the app starts.
 - `showMeasurements` is optional; see [Measurements](#measurements-optional).
   Anything other than `"all"`, `"selected"` or `"none"` falls back to
   `"none"` with a warning.
+- `detailedTextState` is optional, default `false`; see
+  [Detailed text state](#detailed-text-state-detailedtextstate-true).
+  A non-boolean value is ignored with a warning.
 - Unknown top-level keys are ignored.
 
-Every key added after the first release defaults to the old behavior, so
-an existing `config.json` loads exactly as it did.
+**Backward compatibility.** `tools`, `showMeasurements`,
+`detailedTextState` and per-object `locked` all default to the old
+behavior, so an existing `config.json` loads, renders, and reports
+exactly as it did. `tests/compat.test.ts` enforces this for the server:
+it replays a fixed set of API requests with configs that use none of
+these keys and compares every response byte-for-byte with
+`tests/compat/baseline.json`, recorded from the previous server. Only
+re-record the baseline (`tests/compat/record.mjs`) for an intentional
+change to default behavior.
 
 ### Object types
 

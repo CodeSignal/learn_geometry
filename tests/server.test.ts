@@ -1,57 +1,31 @@
 // Runs the real server.js against a test config.json in a temporary folder,
 // the same way production starts it (`node server.js`).
-import { spawn, type ChildProcess } from 'node:child_process';
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { startServer } from './compat/harness.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const TEST_CONFIG = {
   tools: ['line', 'polygon', 'not-a-tool'],
   showMeasurements: 'selected',
+  detailedTextState: true,
   objects: [
     { id: 'base', type: 'line', x1: 0, y1: 0, x2: 4, y2: 0, label: 'AB', locked: true },
   ],
 };
 
-let serverProcess: ChildProcess;
+let server: Awaited<ReturnType<typeof startServer>>;
 let baseUrl: string;
-let workDir: string;
-let serverOutput = '';
 
 beforeAll(async () => {
-  workDir = mkdtempSync(path.join(tmpdir(), 'learn-geometry-test-'));
-  copyFileSync(path.join(repoRoot, 'server.js'), path.join(workDir, 'server.js'));
-  copyFileSync(path.join(repoRoot, 'intersections.js'), path.join(workDir, 'intersections.js'));
-  writeFileSync(path.join(workDir, 'config.json'), JSON.stringify(TEST_CONFIG));
-
-  const port = 40000 + Math.floor(Math.random() * 20000);
-  serverProcess = spawn(process.execPath, ['server.js'], {
-    cwd: workDir,
-    env: { ...process.env, PORT: String(port), NODE_PATH: path.join(repoRoot, 'node_modules') },
-  });
-  baseUrl = await new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`server did not start:\n${serverOutput}`)), 10000);
-    const onData = (chunk: Buffer) => {
-      serverOutput += chunk.toString();
-      const match = serverOutput.match(/listening on port (\d+)/);
-      if (match) {
-        clearTimeout(timer);
-        resolve(`http://127.0.0.1:${match[1]}`);
-      }
-    };
-    serverProcess.stdout?.on('data', onData);
-    serverProcess.stderr?.on('data', onData);
-    serverProcess.on('exit', (code) => reject(new Error(`server exited (${code}):\n${serverOutput}`)));
-  });
+  server = await startServer(repoRoot, TEST_CONFIG);
+  baseUrl = server.baseUrl;
 });
 
 afterAll(() => {
-  serverProcess?.kill();
-  if (workDir) rmSync(workDir, { recursive: true, force: true });
+  server?.stop();
 });
 
 async function postState(objects: unknown[]) {
@@ -72,7 +46,7 @@ describe('startup', () => {
   it('seeds the in-memory state from config.json', async () => {
     const objects = await (await fetch(`${baseUrl}/api/state`)).json();
     expect(objects).toEqual(TEST_CONFIG.objects);
-    expect(serverOutput).not.toContain('Unable to read config.json');
+    expect(server.output()).not.toContain('Unable to read config.json');
   });
 });
 
@@ -82,7 +56,7 @@ describe('GET /api/config', () => {
     expect(config.tools).toEqual(['line', 'polygon']);
     expect(config.showMeasurements).toBe('selected');
     expect(config.objects[0].locked).toBe(true);
-    expect(serverOutput).toContain('unknown tool "not-a-tool"');
+    expect(server.output()).toContain('unknown tool "not-a-tool"');
   });
 });
 
@@ -141,5 +115,56 @@ describe('GET /api/state?format=text', () => {
       'Circle at (10, 10) with radius 1',
       'Function: y = x^2 + 100',
     ]);
+  });
+});
+
+describe('detailedTextState', () => {
+  const objects = [
+    { id: 'a', type: 'line', x1: 0, y1: 0, x2: 4, y2: 0, label: 'AB' },
+    { id: 'b', type: 'line', x1: 0, y1: 0, x2: 0, y2: 3 },
+    { id: 'r', type: 'rectangle', x: -1, y: -1, w: 2, h: 3, rotation: 0.4 },
+    { id: 't', type: 'polygon', points: [[5, 0], [9, 0], [5, 3]], label: 'T' },
+    { id: 'c', type: 'circle', cx: 2, cy: 2, r: 1 },
+  ];
+
+  async function textFor(config: Record<string, unknown>) {
+    const plain = await startServer(repoRoot, { objects, ...config });
+    try {
+      return await (await fetch(`${plain.baseUrl}/api/state?format=text`)).text();
+    } finally {
+      plain.stop();
+    }
+  }
+
+  it('is off by default: no measurements in the text', async () => {
+    const text = await textFor({});
+    expect(text).not.toContain('length');
+    expect(text).not.toContain('  Sides:');
+    expect(text).not.toContain('Relationships');
+  });
+
+  it('only adds to the default text, never changes it', async () => {
+    const plainLines = (await textFor({})).split('\n');
+    const detailedLines = (await textFor({ detailedTextState: true })).split('\n');
+    // Every default line survives in order; on the detailed side it may only
+    // gain a suffix (line measurements) and new lines may appear between.
+    let cursor = 0;
+    for (const line of plainLines) {
+      while (cursor < detailedLines.length && !detailedLines[cursor].startsWith(line)) cursor += 1;
+      expect(cursor, `default line missing from detailed output: ${line}`).toBeLessThan(detailedLines.length);
+      cursor += 1;
+    }
+    expect(detailedLines.length).toBeGreaterThan(plainLines.length);
+  });
+
+  it('ignores a non-boolean value with a warning', async () => {
+    const odd = await startServer(repoRoot, { objects, detailedTextState: 'yes' });
+    try {
+      const text = await (await fetch(`${odd.baseUrl}/api/state?format=text`)).text();
+      expect(text).not.toContain('  Sides:');
+      expect(odd.output()).toContain('"detailedTextState" must be true or false');
+    } finally {
+      odd.stop();
+    }
   });
 });

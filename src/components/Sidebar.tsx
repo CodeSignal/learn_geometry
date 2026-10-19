@@ -263,6 +263,7 @@ function ObjectEditor({ object, onUpdate: update, measurementMode }: ObjectEdito
             <>
               <NumberField
                 disabled={disabled}
+                commitOnlyWhenEdited
                 label="length"
                 value={segmentLength([object.x1, object.y1], [object.x2, object.y2])}
                 onCommit={(length) => {
@@ -271,6 +272,7 @@ function ObjectEditor({ object, onUpdate: update, measurementMode }: ObjectEdito
               />
               <NumberField
                 disabled={disabled}
+                commitOnlyWhenEdited
                 label="angle°"
                 value={directionDeg([object.x1, object.y1], [object.x2, object.y2])}
                 onCommit={(degrees) => onUpdate(lineWithDirection(object, degrees))}
@@ -388,9 +390,14 @@ type NumberFieldProps = {
   value: number;
   onCommit: (value: number) => void;
   disabled?: boolean;
+  // Skip the commit when the learner didn't change the text. The field shows a
+  // 3-decimal rounding, so committing it untouched would quietly round the
+  // real value (a 5.8309… length to 5.831). The original fields commit on
+  // every blur as they always have.
+  commitOnlyWhenEdited?: boolean;
 };
 
-function NumberField({ label, value, onCommit, disabled }: NumberFieldProps) {
+function NumberField({ label, value, onCommit, disabled, commitOnlyWhenEdited }: NumberFieldProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [draft, setDraft] = useState(() => formatDraft(value));
 
@@ -401,9 +408,7 @@ function NumberField({ label, value, onCommit, disabled }: NumberFieldProps) {
   }, [value]);
 
   function commit() {
-    // An untouched field shows a rounded value; committing it would quietly
-    // round the real one (e.g. a 5.8309… length to 5.831).
-    if (draft === formatDraft(value)) return;
+    if (commitOnlyWhenEdited && draft === formatDraft(value)) return;
     const next = Number(draft);
     if (!Number.isFinite(next)) {
       setDraft(formatDraft(value));

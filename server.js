@@ -43,8 +43,11 @@ app.get('/api/state', (request, response) => {
   const format = request.query.format === 'text' ? 'text' : 'json';
 
   if (format === 'text') {
-    const lines = state.objects.map(summarizeObject);
-    const relationships = describeRelationships(state.objects);
+    // Measurements are only added when the config opts in, so existing tasks
+    // keep getting exactly the text they were written against.
+    const detailed = readConfig().detailedTextState;
+    const lines = state.objects.map((object) => summarizeObject(object, detailed));
+    const relationships = detailed ? describeRelationships(state.objects) : [];
     if (relationships.length > 0) {
       lines.push('');
       lines.push(`Relationships (${relationships.length}):`);
@@ -184,7 +187,8 @@ function normalizeConfig(value) {
   const viewCenter = parseViewCenter(value.viewCenter);
   const tools = parseTools(value.tools);
   const showMeasurements = parseMeasurementMode(value.showMeasurements);
-  return { objects, task, sidebarOpen, viewCenter, tools, showMeasurements };
+  const detailedTextState = parseDetailedTextState(value.detailedTextState);
+  return { objects, task, sidebarOpen, viewCenter, tools, showMeasurements, detailedTextState };
 }
 
 // `tools` lists which drawing tools the toolbar shows; Drag / Select is always
@@ -203,12 +207,23 @@ function parseTools(value) {
   return DRAWING_TOOLS.filter((tool) => value.includes(tool));
 }
 
-// Omitted means "none", so a config without the key behaves as before.
+// Omitted (or invalid) leaves it out of /api/config entirely; the frontend
+// then shows no measurements, as before.
 function parseMeasurementMode(value) {
-  if (value === undefined) return 'none';
+  if (value === undefined) return undefined;
   if (!MEASUREMENT_MODES.includes(value)) {
     console.warn(`Config: "showMeasurements" must be one of ${MEASUREMENT_MODES.join(', ')} (got ${JSON.stringify(value)}) — using "none"`);
-    return 'none';
+    return undefined;
+  }
+  return value;
+}
+
+// `detailedTextState: true` adds measurements to GET /api/state?format=text.
+function parseDetailedTextState(value) {
+  if (value === undefined) return false;
+  if (typeof value !== 'boolean') {
+    console.warn(`Config: "detailedTextState" must be true or false (got ${JSON.stringify(value)}) — using false`);
+    return false;
   }
   return value;
 }
@@ -269,7 +284,9 @@ function validateTask(task) {
   };
 }
 
-function summarizeObject(object) {
+// With `detailed`, appends measurements; the text that's there without it is
+// left exactly as it was.
+function summarizeObject(object, detailed) {
   if (!object || typeof object !== 'object') {
     return 'Unknown object';
   }
@@ -285,17 +302,20 @@ function summarizeObject(object) {
     case 'line': {
       const start = [object.x1, object.y1];
       const end = [object.x2, object.y2];
-      return `Line${label} from (${formatNumber(object.x1)}, ${formatNumber(object.y1)}) to (${formatNumber(object.x2)}, ${formatNumber(object.y2)}), length ${formatNumber(segmentLength(start, end))}, direction ${formatDegrees(directionDeg(start, end))}${locked}`;
+      const measures = detailed
+        ? `, length ${formatComputed(segmentLength(start, end))}, direction ${formatDegrees(directionDeg(start, end))}`
+        : '';
+      return `Line${label} from (${formatNumber(object.x1)}, ${formatNumber(object.y1)}) to (${formatNumber(object.x2)}, ${formatNumber(object.y2)})${measures}${locked}`;
     }
     case 'rectangle':
       return [
         `Rectangle${label} at (${formatNumber(object.x)}, ${formatNumber(object.y)}) with width ${formatNumber(object.w)}, height ${formatNumber(object.h)}, and ${formatRotation(object.rotation)}${locked}`,
-        ...describeShape(objectVertices(object)),
+        ...(detailed ? describeShape(objectVertices(object)) : []),
       ].join('\n');
     case 'polygon':
       return [
         `Polygon${label} with points ${formatPoints(object.points)} and ${formatRotation(object.rotation)}${locked}`,
-        ...describeShape(objectVertices(object)),
+        ...(detailed ? describeShape(objectVertices(object)) : []),
       ].join('\n');
     case 'function':
       return `Function${label}: y = ${object.expression}${locked}`;
@@ -314,7 +334,7 @@ function describeShape(vertices) {
   const angles = interiorAngles(vertices);
   const details = [
     `  Vertices: ${vertices.map((vertex, index) => `${vertexName(index)} ${formatPoint(vertex)}`).join(', ')}`,
-    `  Sides: ${sides.map((side, index) => `${sideName(index)} = ${formatNumber(side)}`).join(', ')}`,
+    `  Sides: ${sides.map((side, index) => `${sideName(index)} = ${formatComputed(side)}`).join(', ')}`,
     `  Angles: ${angles.map((angle, index) => `${vertexName(index)} = ${formatDegrees(angle)}`).join(', ')}`,
     `  Shape: ${classifyPolygon(vertices)}`,
   ];
@@ -339,7 +359,9 @@ function describeRelationships(objects) {
   for (const joint of sharedEndpointAngles(objects)) {
     const a = objects.find((object) => object.id === joint.lineIds[0]);
     const b = objects.find((object) => object.id === joint.lineIds[1]);
-    out.push(`Angle between ${lineRef(a)} and ${lineRef(b)} at ${formatPoint(joint.vertex)}: ${formatDegrees(joint.degrees)}`);
+    // The vertex is an endpoint of both lines, so print it the way their own
+    // lines do.
+    out.push(`Angle between ${lineRef(a)} and ${lineRef(b)} at ${formatPoint(joint.vertex, formatNumber)}: ${formatDegrees(joint.degrees)}`);
   }
   return out;
 }
@@ -353,12 +375,12 @@ function vertexName(index) {
   return index < 26 ? String.fromCharCode(65 + index) : `V${index + 1}`;
 }
 
-function formatPoint(point) {
-  return `(${formatNumber(point[0])}, ${formatNumber(point[1])})`;
+function formatPoint(point, format = formatComputed) {
+  return `(${format(point[0])}, ${format(point[1])})`;
 }
 
 function formatDegrees(degrees) {
-  return Number.isFinite(degrees) ? `${formatNumber(degrees)}°` : 'undefined';
+  return Number.isFinite(degrees) ? `${formatComputed(degrees)}°` : 'undefined';
 }
 
 function formatRotation(rotation) {
@@ -382,7 +404,14 @@ function formatNumber(value) {
     return String(value);
   }
 
-  const text = Number.isInteger(number) ? String(number) : number.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
-  // Tiny negatives such as -1e-16 from rotation math would otherwise print as "-0".
+  return Number.isInteger(number) ? String(number) : number.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+// For numbers the detailed output computes (lengths, angles, rotated
+// vertices): like formatNumber, but tiny negatives such as -1e-16 from
+// rotation math print as "0" rather than "-0". formatNumber itself keeps
+// printing "-0" because existing output depends on it.
+function formatComputed(value) {
+  const text = formatNumber(value);
   return text === '-0' ? '0' : text;
 }

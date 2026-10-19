@@ -123,9 +123,7 @@ export function formatNumber(value: number): string {
     return String(value);
   }
 
-  const text = Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
-  // Tiny negatives such as -1e-16 from rotation math would otherwise show as "-0".
-  return text === '-0' ? '0' : text;
+  return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
 }
 
 export function objectIcon(object: GeomObject): string {

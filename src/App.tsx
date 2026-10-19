@@ -131,23 +131,23 @@ export default function App() {
   useEffect(() => {
     function handleKey(event: KeyboardEvent) {
       if (isEditableTarget(event.target)) return;
-      const selected = selectedId ? objects.find((object) => object.id === selectedId) : undefined;
-      if ((event.key === 'Delete' || event.key === 'Backspace') && selected) {
+      if ((event.key === 'Delete' || event.key === 'Backspace') && selectedId) {
         event.preventDefault();
-        if (selected.locked) return;
-        const id = selected.id;
+        if (objects.some((object) => object.id === selectedId && object.locked)) return;
+        const id = selectedId;
         setSelectedId(null);
         commit(objects.filter((object) => object.id !== id));
         return;
       }
       const arrowDelta = NUDGE_BY_ARROW[event.key];
-      if (arrowDelta && selected) {
-        if (selected.type !== 'function' && !selected.locked) {
+      if (arrowDelta && selectedId) {
+        const selected = objects.find((object) => object.id === selectedId);
+        if (selected && selected.type !== 'function' && !selected.locked) {
           event.preventDefault();
           const multiplier = event.shiftKey ? 5 : 1;
           const [dx, dy] = arrowDelta;
           const updated = translateObject(selected, dx * multiplier, dy * multiplier);
-          commit(objects.map((object) => (object.id === selected.id ? updated : object)));
+          commit(objects.map((object) => (object.id === selectedId ? updated : object)));
           return;
         }
       }
