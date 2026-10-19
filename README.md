@@ -29,13 +29,40 @@ For a one-process production build:
 npm run preview    # builds dist/, serves everything from Express on :3000
 ```
 
-Checks (neither is part of the release build):
+Checks (the construction build runs `npm test` before packaging; the main
+release build runs neither):
 
 ```sh
 npm test           # Vitest: geometry math, frontend/server parity, server output,
                    #   and backward compatibility (see below)
 npm run typecheck  # tsc --noEmit (vite build doesn't type-check)
 ```
+
+---
+
+## Releases
+
+Two GitHub Actions workflows publish the same `release.tar.gz` layout
+(`dist`, `server.js`, `intersections.js`, `config.json`, `package.json`,
+`node_modules`) for tasks to download and start with
+`IS_PRODUCTION=true node server.js`:
+
+| Build | Workflow | Runs on | Tags | Becomes "latest"? |
+|---|---|---|---|---|
+| Main | `release.yml` | pushes to `main` | `release-<sha>` | Yes |
+| Construction | `release-construction.yml` | pushes to `feat/construction-path` | `construction-<sha>` and `construction-latest` | Never (pre-release) |
+
+Existing tasks keep pulling the main build. Construction-path tasks pull
+the construction build instead, either pinned to one commit or always the
+newest:
+
+```sh
+curl -sL "https://github.com/CodeSignal/learn_geometry/releases/download/construction-<sha>/release.tar.gz" | tar xz
+curl -sL "https://github.com/CodeSignal/learn_geometry/releases/download/construction-latest/release.tar.gz" | tar xz
+```
+
+Pinning `construction-<sha>` means a task only changes when its URL is
+updated; `construction-latest` changes on every push to the branch.
 
 ---
 

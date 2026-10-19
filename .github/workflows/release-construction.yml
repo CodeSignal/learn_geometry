@@ -1,0 +1,84 @@
+name: Construction build
+
+# A separate build of feat/construction-path for the construction-path
+# courses. It runs only on pushes to that branch and publishes pre-releases
+# under construction-* tags, which never become the repository's "latest"
+# release. Tasks pulling the latest build (from main, via release.yml) are
+# unaffected.
+#
+#   construction-<sha>   that commit's build; pin this for stable tasks
+#   construction-latest  always the newest build of the branch
+on:
+  push:
+    branches:
+      - feat/construction-path
+
+permissions:
+  contents: write
+
+# Two pushes in quick succession must not race on construction-latest.
+concurrency:
+  group: construction-build
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Prune dev dependencies
+        run: npm prune --production
+
+      # Same file list as release.yml, so the package has the same layout.
+      - name: Create release artifact
+        run: tar -czf release.tar.gz dist server.js intersections.js config.json package.json node_modules
+
+      - name: Publish this commit's build
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: construction-${{ github.sha }}
+          name: Construction build ${{ github.sha }}
+          # Without this, a new tag would be created on the default branch.
+          target_commitish: ${{ github.sha }}
+          body: Build of feat/construction-path at ${{ github.sha }}.
+          files: release.tar.gz
+          prerelease: true
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move construction-latest to this commit
+        run: |
+          git tag -f construction-latest "$GITHUB_SHA"
+          git push -f origin refs/tags/construction-latest
+
+      - name: Publish construction-latest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: construction-latest
+          name: Construction build (latest)
+          body: Newest build of feat/construction-path, currently ${{ github.sha }}.
+          files: release.tar.gz
+          overwrite_files: true
+          prerelease: true
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
